@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { ExperimentInfo, JudgeInfo, EvalResponse } from '../types';
+import type { ExperimentInfo, JudgeInfo, EvalResponse, EvalHistoryRun, EvalTraceRow } from '../types';
 import { apiFetch, useMutation } from './useApi';
 
 export function useExperiments() {
@@ -239,4 +239,45 @@ export function useRunEval() {
   }, []);
 
   return { result, loading, error, runEval, abort, reset };
+}
+
+export function useRunTraces(runId: string | null) {
+  const [rows, setRows] = useState<EvalTraceRow[]>([]);
+  const [scorer, setScorer] = useState<string>('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!runId) { setRows([]); setScorer(''); return; }
+    setLoading(true);
+    setError(null);
+    const params = new URLSearchParams({ run_id: runId });
+    apiFetch<{ scorer: string; rows: EvalTraceRow[] }>(`/eval/run-traces?${params}`)
+      .then((d) => { setRows(d.rows); setScorer(d.scorer); })
+      .catch((e) => { setRows([]); setError(String(e)); })
+      .finally(() => setLoading(false));
+  }, [runId]);
+
+  return { rows, scorer, loading, error };
+}
+
+export function useEvalHistory(promptName: string | null, experimentName: string) {
+  const [runs, setRuns] = useState<EvalHistoryRun[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (!promptName) {
+      setRuns([]);
+      return;
+    }
+    setLoading(true);
+    const params = new URLSearchParams({ prompt_name: promptName });
+    if (experimentName) params.set('experiment_name', experimentName);
+    apiFetch<{ runs: EvalHistoryRun[] }>(`/eval/history?${params}`)
+      .then((d) => setRuns(d.runs))
+      .catch(() => setRuns([]))
+      .finally(() => setLoading(false));
+  }, [promptName, experimentName]);
+
+  return { runs, loading };
 }

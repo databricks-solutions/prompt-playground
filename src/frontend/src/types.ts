@@ -97,6 +97,26 @@ export interface JudgeInfo {
   type?: 'custom' | 'guidelines' | 'builtin';
 }
 
+export interface EvalTraceRow {
+  row_index: number;
+  score: number | string | null;
+  rationale: string | null;
+  details: { name: string; value: number | string | null; rationale: string | null }[] | null;
+}
+
+export interface EvalHistoryRun {
+  run_id: string;
+  run_name: string;
+  created_at: number;  // ms epoch
+  avg_score: number | null;
+  model: string;
+  dataset: string;
+  scorer: string;
+  prompt_version: string;
+  total_rows: number | null;
+  run_url: string;
+}
+
 export interface AppConfig {
   prompt_catalog: string;
   prompt_schema: string;

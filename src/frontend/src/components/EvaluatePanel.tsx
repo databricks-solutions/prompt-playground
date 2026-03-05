@@ -7,6 +7,7 @@ import { useEvalTables, useEvalColumns, useTablePreview, useRunEval, useJudges, 
 import { parseTemplateVariables } from '../utils/templateUtils';
 import JudgeForm from './eval/JudgeForm';
 import DatasetTable from './eval/DatasetTable';
+import EvalRunHistory from './eval/EvalRunHistory';
 import ConfirmDialog from './ConfirmDialog';
 
 const BUILTIN_JUDGES = [
@@ -224,6 +225,15 @@ export default function EvaluatePanel({
             options={prompts.map((p) => ({ value: p.name, label: p.name.split('.').pop() ?? p.name }))}
           />
         </div>
+
+        {/* Eval history — prompt level, all versions */}
+        {selectedPrompt && (
+          <EvalRunHistory
+            promptName={selectedPrompt}
+            promptVersion={selectedVersion}
+            experimentName={experimentName}
+          />
+        )}
 
         {/* Version picker */}
         {selectedPrompt && (

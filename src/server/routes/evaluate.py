@@ -10,7 +10,7 @@ from server.templates import render_template, parse_system_user
 from server.mlflow_helpers import configure_mlflow, get_experiment_id, experiment_url as make_experiment_url, get_mlflow_client, EXPERIMENT_NAME
 from server.llm import call_model
 from server.warehouse import list_eval_tables, get_table_columns, read_table_rows, count_table_rows
-from server.evaluation import mlflow_genai_evaluate
+from server.evaluation import mlflow_genai_evaluate, _extract_row_scores
 from server.settings import get_effective_config
 
 logger = logging.getLogger(__name__)
@@ -256,6 +256,94 @@ async def api_get_columns(catalog: str, schema: str, table: str):
         return {"columns": cols}
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/history")
+async def api_eval_history(
+    prompt_name: str,
+    prompt_version: str | None = None,
+    experiment_name: str | None = None,
+    limit: int = 10,
+):
+    """Return past batch eval runs for a prompt (optionally filtered to one version), newest first."""
+    try:
+        configure_mlflow()
+        client = get_mlflow_client()
+        exp_name = experiment_name or EXPERIMENT_NAME
+        exp = await asyncio.to_thread(client.get_experiment_by_name, exp_name)
+        if not exp:
+            return {"runs": []}
+
+        filter_parts = [
+            f"tags.prompt_name = '{prompt_name}'",
+            "tags.eval_type = 'batch'",
+        ]
+        if prompt_version is not None:
+            filter_parts.insert(1, f"tags.prompt_version = '{prompt_version}'")
+        filter_string = " AND ".join(filter_parts)
+
+        effective_limit = limit if prompt_version is not None else max(limit, 50)
+        runs = await asyncio.to_thread(
+            client.search_runs,
+            [exp.experiment_id],
+            filter_string,
+            max_results=effective_limit,
+            order_by=["attribute.start_time DESC"],
+        )
+
+        exp_url_base = make_experiment_url(exp.experiment_id)
+        result = []
+        for run in runs:
+            tags = run.data.tags
+            metrics = run.data.metrics
+            scorer = tags.get("scorer", "response_quality")
+
+            avg_score = None
+            for key in [f"{scorer}/mean", scorer, "response_quality/mean"]:
+                if key in metrics:
+                    avg_score = round(metrics[key], 2)
+                    break
+
+            result.append({
+                "run_id": run.info.run_id,
+                "run_name": run.info.run_name or "",
+                "created_at": run.info.start_time,
+                "avg_score": avg_score,
+                "model": tags.get("model", ""),
+                "dataset": tags.get("dataset", ""),
+                "scorer": scorer,
+                "prompt_version": tags.get("prompt_version", ""),
+                "total_rows": int(tags["total_rows"]) if tags.get("total_rows") else None,
+                "run_url": f"{exp_url_base}/runs/{run.info.run_id}",
+            })
+
+        return {"runs": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/run-traces")
+async def api_run_traces(run_id: str):
+    """Return per-row scores and rationales extracted from MLflow traces for a historical eval run."""
+    try:
+        configure_mlflow()
+        client = get_mlflow_client()
+        run = await asyncio.to_thread(client.get_run, run_id)
+        scorer_name = run.data.tags.get("scorer", "response_quality")
+        row_scores = await asyncio.to_thread(_extract_row_scores, run_id, scorer_name)
+
+        rows = []
+        for row_idx in sorted(row_scores.keys()):
+            score, rationale, details = row_scores[row_idx]
+            rows.append({
+                "row_index": row_idx,
+                "score": score,
+                "rationale": rationale,
+                "details": details,
+            })
+        return {"scorer": scorer_name, "rows": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
