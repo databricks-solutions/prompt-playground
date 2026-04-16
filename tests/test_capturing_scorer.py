@@ -4,7 +4,7 @@ Covers:
 - _CapturingScorer captures single Feedback scores into captured dict
 - _CapturingScorer captures guidelines (list of Feedback) scores
 - _CapturingScorer passes results through unchanged to caller
-- _CapturingScorer handles None row_index gracefully
+- _CapturingScorer stops capturing when counter exhausted
 - _wrap_scorers_for_capture wraps all scorers
 - _link_prompt_to_traces links prompt to all traces in a run
 - _link_prompt_to_traces is non-fatal on errors
@@ -42,8 +42,8 @@ class TestCapturingScorer:
         feedback = Feedback(name="quality", value=4.5, rationale="good response")
         inner = self._make_inner_scorer(feedback)
 
-        scorer = _CapturingScorer(inner, captured)
-        result = scorer.run(inputs={"request": "test", "_row_index": 0}, outputs={"response": "hi"})
+        scorer = _CapturingScorer(inner, captured, num_rows=1)
+        result = scorer.run(inputs={"request": "test"}, outputs={"response": "hi"})
 
         assert result is feedback  # passthrough
         assert 0 in captured
@@ -55,10 +55,10 @@ class TestCapturingScorer:
         feedback = Feedback(name="safety", value="yes", rationale="safe")
         inner = self._make_inner_scorer(feedback)
 
-        scorer = _CapturingScorer(inner, captured)
-        scorer.run(inputs={"request": "test", "_row_index": 1}, outputs={"response": "hi"})
-
-        assert captured[1][0] == 1.0
+        scorer = _CapturingScorer(inner, captured, num_rows=2)
+        scorer.run(inputs={"request": "test"}, outputs={"response": "hi"})  # row 0
+        # Verify row 0 captured
+        assert captured[0][0] == 1.0
 
     def test_captures_guidelines_list(self):
         """A list of Feedback (guidelines scorer) is captured as pass/total summary."""
@@ -70,23 +70,23 @@ class TestCapturingScorer:
         ]
         inner = self._make_inner_scorer(feedbacks)
 
-        scorer = _CapturingScorer(inner, captured)
-        result = scorer.run(inputs={"request": "test", "_row_index": 2}, outputs={"response": "hi"})
+        scorer = _CapturingScorer(inner, captured, num_rows=1)
+        result = scorer.run(inputs={"request": "test"}, outputs={"response": "hi"})
 
         assert result is feedbacks
-        assert 2 in captured
-        score, rationale, details = captured[2]
+        assert 0 in captured
+        score, rationale, details = captured[0]
         assert score == "2/3"  # 2 passes out of 3
         assert rationale is None
         assert len(details) == 3
 
-    def test_no_capture_when_row_index_missing(self):
-        """If _row_index is not in inputs, nothing is captured."""
+    def test_no_capture_when_counter_exhausted(self):
+        """Once all rows are consumed, extra calls are not captured."""
         captured: dict[int, RowScore] = {}
         feedback = Feedback(name="quality", value=3.0, rationale="ok")
         inner = self._make_inner_scorer(feedback)
 
-        scorer = _CapturingScorer(inner, captured)
+        scorer = _CapturingScorer(inner, captured, num_rows=0)
         scorer.run(inputs={"request": "test"}, outputs={"response": "hi"})
 
         assert len(captured) == 0
@@ -97,8 +97,8 @@ class TestCapturingScorer:
         feedback = Feedback(name="quality", value=5.0, rationale="great")
         inner = self._make_inner_scorer(feedback)
 
-        scorer = _CapturingScorer(inner, captured)
-        result = scorer.run(inputs={"request": "test", "_row_index": 0}, outputs={"response": "hi"})
+        scorer = _CapturingScorer(inner, captured, num_rows=1)
+        result = scorer.run(inputs={"request": "test"}, outputs={"response": "hi"})
 
         assert result is feedback
         assert result.value == 5.0
@@ -108,20 +108,37 @@ class TestCapturingScorer:
         captured: dict[int, RowScore] = {}
         inner = self._make_inner_scorer(Feedback(name="q", value=1.0))
 
-        scorer = _CapturingScorer(inner, captured)
+        scorer = _CapturingScorer(inner, captured, num_rows=1)
         scorer.run(
-            inputs={"request": "x", "_row_index": 0},
+            inputs={"request": "x"},
             outputs={"response": "y"},
             expectations={"expected": "z"},
         )
 
         inner.run.assert_called_once_with(
-            inputs={"request": "x", "_row_index": 0},
+            inputs={"request": "x"},
             outputs={"response": "y"},
             expectations={"expected": "z"},
             trace=None,
             session=None,
         )
+
+    def test_sequential_rows_get_correct_indices(self):
+        """Multiple sequential calls capture with incrementing row indices."""
+        captured: dict[int, RowScore] = {}
+        inner = MagicMock()
+        inner.name = "test_scorer"
+        inner.run.side_effect = [
+            Feedback(name="quality", value=3.0, rationale="ok"),
+            Feedback(name="quality", value=5.0, rationale="great"),
+        ]
+
+        scorer = _CapturingScorer(inner, captured, num_rows=2)
+        scorer.run(inputs={"request": "a"}, outputs={"response": "r1"})
+        scorer.run(inputs={"request": "b"}, outputs={"response": "r2"})
+
+        assert captured[0] == (3.0, "ok", None)
+        assert captured[1] == (5.0, "great", None)
 
 
 # ---------------------------------------------------------------------------
@@ -137,7 +154,7 @@ class TestWrapScorersForCapture:
         inner2 = MagicMock()
         inner2.name = "scorer2"
 
-        wrapped = _wrap_scorers_for_capture([inner1, inner2], captured)
+        wrapped = _wrap_scorers_for_capture([inner1, inner2], captured, num_rows=3)
 
         assert len(wrapped) == 2
         assert all(isinstance(s, _CapturingScorer) for s in wrapped)
@@ -147,7 +164,7 @@ class TestWrapScorersForCapture:
         inner = MagicMock()
         inner.name = "my_scorer"
 
-        wrapped = _wrap_scorers_for_capture([inner], captured)
+        wrapped = _wrap_scorers_for_capture([inner], captured, num_rows=1)
 
         assert wrapped[0].name == "my_scorer"
 
@@ -236,5 +253,3 @@ class TestLinkPromptToTraces:
             _link_prompt_to_traces("run-123", "catalog.schema.prompt", "1")
 
         mock_client.link_prompt_versions_to_trace.assert_not_called()
-
-

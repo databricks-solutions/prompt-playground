@@ -59,25 +59,27 @@ def mlflow_genai_evaluate(
     model_name = predict_config["model_name"]
     temperature = predict_config["temperature"]
 
-    # Collect responses as predict_fn runs so the route can return them
+    # Collect responses as predict_fn runs so the route can return them.
+    # Track row index via a counter instead of embedding _row_index in the
+    # eval_data inputs — that would leak a synthetic field into MLflow traces.
     responses: list[str | None] = [None] * len(eval_rows)
+    _predict_call_counter = iter(range(len(eval_rows)))
 
-    def predict_fn(request: str, _row_index: int = -1, system_prompt: str | None = None) -> str:
+    def predict_fn(request: str, system_prompt: str | None = None) -> str:
         """Sync predict function for evaluate() — calls model via OpenAI SDK.
 
         evaluate() runs this in a ThreadPoolExecutor (default 10 workers),
         and autologging captures token usage on each trace.
         Parameter names must match the keys in the eval_data "inputs" dicts.
         """
-        row_idx = _row_index
-        request_text = request
+        row_idx = next(_predict_call_counter, None)
 
         loop = asyncio.new_event_loop()
         try:
             result = loop.run_until_complete(
                 call_model(
                     endpoint_name=model_name,
-                    prompt=request_text,
+                    prompt=request,
                     temperature=temperature,
                     system_prompt=system_prompt,
                 )
@@ -100,7 +102,6 @@ def mlflow_genai_evaluate(
         entry: dict = {
             "inputs": {
                 "request": row["request"],
-                "_row_index": idx,
             },
         }
         if row.get("system_prompt"):
@@ -115,7 +116,7 @@ def mlflow_genai_evaluate(
     # experiments, result_df is often None and search_traces may fail, so this
     # in-memory capture is the most reliable way to get per-row scores.
     captured_scores: dict[int, RowScore] = {}
-    scorers = _wrap_scorers_for_capture(scorers, captured_scores)
+    scorers = _wrap_scorers_for_capture(scorers, captured_scores, len(eval_rows))
 
     try:
         eval_result = mlflow.genai.evaluate(
@@ -158,16 +159,20 @@ class _CapturingScorer(Scorer):
     and search_traces may fail. Capturing scores in memory during evaluation
     is the most reliable way to get per-row results.
 
-    Uses object.__setattr__ to store _inner and _captured because Scorer is a
-    Pydantic BaseModel that rejects undeclared fields.
+    Row index is tracked via an internal counter rather than reading a
+    synthetic field from inputs, so no bookkeeping data leaks into traces.
+
+    Uses object.__setattr__ to store _inner, _captured, and _counter because
+    Scorer is a Pydantic BaseModel that rejects undeclared fields.
     """
 
     name: str = "capturing_scorer"
 
-    def __init__(self, inner, captured: dict[int, RowScore]):
+    def __init__(self, inner, captured: dict[int, RowScore], num_rows: int):
         super().__init__(name=getattr(inner, 'name', 'scorer'))
         object.__setattr__(self, '_inner', inner)
         object.__setattr__(self, '_captured', captured)
+        object.__setattr__(self, '_counter', iter(range(num_rows)))
 
     def run(self, *, inputs=None, outputs=None, expectations=None, trace=None, session=None):
         """Override run() to intercept scorer results.
@@ -181,8 +186,8 @@ class _CapturingScorer(Scorer):
             trace=trace, session=session,
         )
 
-        # Extract row index from inputs
-        row_idx = inputs.get('_row_index') if isinstance(inputs, dict) else None
+        # Derive row index from call order
+        row_idx = next(self._counter, None)
         if row_idx is None:
             return result
 
@@ -212,9 +217,9 @@ class _CapturingScorer(Scorer):
         return self._inner(**kwargs)
 
 
-def _wrap_scorers_for_capture(scorers: list, captured: dict[int, RowScore]) -> list:
+def _wrap_scorers_for_capture(scorers: list, captured: dict[int, RowScore], num_rows: int) -> list:
     """Wrap each scorer in a _CapturingScorer to capture per-row scores in memory."""
-    return [_CapturingScorer(s, captured) for s in scorers]
+    return [_CapturingScorer(s, captured, num_rows) for s in scorers]
 
 
 def _resolve_scorers(scorer_name: str | None, model_name: str, judge_model: str | None = None, judge_temperature: float = 0.0) -> list:

@@ -65,15 +65,23 @@ EXCLUDE_NAME_PATTERNS = [
 FOUNDATION_PREFIX = "databricks-"
 
 
+_openai_client: AsyncOpenAI | None = None
+_openai_client_token: str | None = None
+
+
 def _get_openai_client() -> AsyncOpenAI:
-    """Build an AsyncOpenAI client pointed at the Databricks serving endpoint."""
+    """Return a cached AsyncOpenAI client, refreshing when the token changes."""
+    global _openai_client, _openai_client_token
     host = get_workspace_host()
     token = get_oauth_token()
-    return AsyncOpenAI(
-        api_key=token,
-        base_url=f"{host}/serving-endpoints",
-        timeout=120.0,
-    )
+    if _openai_client is None or token != _openai_client_token:
+        _openai_client = AsyncOpenAI(
+            api_key=token,
+            base_url=f"{host}/serving-endpoints",
+            timeout=120.0,
+        )
+        _openai_client_token = token
+    return _openai_client
 
 
 def _clean_state(state_str: str) -> str:
@@ -186,7 +194,7 @@ async def call_model(
 
         raise Exception(f"Model API error ({e.status_code}): {error_text}")
 
-    content = response.choices[0].message.content or "" if response.choices else ""
+    content = (response.choices[0].message.content or "") if response.choices else ""
     usage = {}
     if response.usage:
         usage = {

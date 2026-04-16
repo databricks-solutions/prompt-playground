@@ -51,6 +51,10 @@ def _make_success_response(content: str = "hello", model: str = "test-model"):
 @pytest.fixture(autouse=True)
 def _patch_config(monkeypatch):
     monkeypatch.setenv("DATABRICKS_HOST", "https://test.databricks.com")
+    # Reset cached client so each test starts fresh
+    import server.llm
+    server.llm._openai_client = None
+    server.llm._openai_client_token = None
     with patch("server.llm.get_workspace_host", return_value="https://test.databricks.com"), \
          patch("server.llm.get_oauth_token", return_value="test-token"):
         yield
