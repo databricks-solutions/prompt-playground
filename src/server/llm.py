@@ -1,7 +1,14 @@
-"""Foundation Model / AI Gateway integration for running prompts."""
+"""Foundation Model / AI Gateway integration for running prompts.
 
+Uses the OpenAI SDK to call Databricks serving endpoints (which expose an
+OpenAI-compatible API).  Combined with ``mlflow.openai.autolog()`` (enabled
+at app startup), every call automatically produces MLflow traces with token
+usage, latencies, and structured spans — no manual span plumbing required.
+"""
+
+import re
 import logging
-import aiohttp
+from openai import AsyncOpenAI, APIStatusError, APITimeoutError
 from server.config import get_workspace_host, get_oauth_token, get_workspace_client
 
 logger = logging.getLogger(__name__)
@@ -56,6 +63,17 @@ EXCLUDE_NAME_PATTERNS = [
 
 # Foundation Model API endpoints always start with "databricks-"
 FOUNDATION_PREFIX = "databricks-"
+
+
+def _get_openai_client() -> AsyncOpenAI:
+    """Build an AsyncOpenAI client pointed at the Databricks serving endpoint."""
+    host = get_workspace_host()
+    token = get_oauth_token()
+    return AsyncOpenAI(
+        api_key=token,
+        base_url=f"{host}/serving-endpoints",
+        timeout=120.0,
+    )
 
 
 def _clean_state(state_str: str) -> str:
@@ -116,80 +134,69 @@ async def call_model(
     temperature: float = 1.0,
     system_prompt: str | None = None,
 ) -> dict:
-    """Call a Foundation Model endpoint with the rendered prompt."""
-    host = get_workspace_host()
-    token = get_oauth_token()
-    url = f"{host}/serving-endpoints/{endpoint_name}/invocations"
+    """Call a Databricks serving endpoint via the OpenAI SDK.
 
-    messages = []
+    mlflow.openai.autolog() (enabled at app startup) automatically traces
+    every call, capturing token usage, latencies, and model parameters.
+    """
+    client = _get_openai_client()
+
+    messages: list[dict[str, str]] = []
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
 
-    payload = {
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
+    try:
+        response = await client.chat.completions.create(
+            model=endpoint_name,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+    except APITimeoutError:
+        raise TokenLimitError(
+            "Request timed out — the prompt may be too long for this model. "
+            "Try reducing the prompt length or the number of variables."
+        )
+    except APIStatusError as e:
+        error_text = e.message or str(e)
+        error_lower = error_text.lower()
 
-    timeout = aiohttp.ClientTimeout(total=120)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(url, json=payload, headers=headers) as response:
-            if response.status != 200:
-                error_text = await response.text()
-                error_lower = error_text.lower()
+        # Rate limit: HTTP 429 or REQUEST_LIMIT_EXCEEDED in body
+        if e.status_code == 429 or "request_limit_exceeded" in error_lower:
+            raise RateLimitError(
+                f"Rate limit exceeded for endpoint '{endpoint_name}'. "
+                "Try again in a few minutes or reduce concurrency."
+            )
 
-                # Rate limit: HTTP 429 or REQUEST_LIMIT_EXCEEDED in body
-                if response.status == 429 or "request_limit_exceeded" in error_lower:
-                    raise RateLimitError(
-                        f"Rate limit exceeded for endpoint '{endpoint_name}'. "
-                        "Try again in a few minutes or reduce concurrency."
-                    )
+        # Token / context-length limit
+        if any(kw in error_lower for kw in _TOKEN_LIMIT_KEYWORDS):
+            raise TokenLimitError(
+                "Prompt exceeds the model's context window. "
+                "Try reducing the prompt length or the number of variables."
+            )
 
-                # Token / context-length limit
-                if any(kw in error_lower for kw in _TOKEN_LIMIT_KEYWORDS):
-                    raise TokenLimitError(
-                        f"Prompt exceeds the model's context window. "
-                        "Try reducing the prompt length or the number of variables."
-                    )
+        # Temperature-unsupported errors from external model proxies
+        if e.status_code == 400 and "temperature" in error_text:
+            search_text = error_text
+            if "unsupported" in search_text.lower() or "not support" in search_text.lower():
+                match = re.search(r"Only the default \(([^)]+)\) value is supported", search_text, re.IGNORECASE)
+                hint = f" Try setting it to {match.group(1)}." if match else " Try adjusting temperature in settings."
+                raise Exception(f"This model doesn't support the current temperature value.{hint}")
 
-                # Detect temperature-unsupported errors from external model proxies (e.g. Azure OpenAI)
-                if response.status == 400 and "temperature" in error_text:
-                    import re, json as _json
-                    # Unwrap Databricks outer envelope and any nested JSON string to get the real message
-                    search_text = error_text
-                    try:
-                        outer = _json.loads(error_text)
-                        inner_str = outer.get("message", "")
-                        inner = _json.loads(inner_str) if isinstance(inner_str, str) else inner_str
-                        search_text = (
-                            inner.get("error", {}).get("message", "")
-                            or inner.get("message", "")
-                            or error_text
-                        )
-                    except Exception:
-                        pass
-                    if "unsupported" in search_text.lower() or "not support" in search_text.lower():
-                        match = re.search(r"Only the default \(([^)]+)\) value is supported", search_text, re.IGNORECASE)
-                        hint = f" Try setting it to {match.group(1)}." if match else " Try adjusting temperature in settings."
-                        raise Exception(f"This model doesn't support the current temperature value.{hint}")
-                raise Exception(f"Model API error ({response.status}): {error_text}")
-            data = await response.json()
+        raise Exception(f"Model API error ({e.status_code}): {error_text}")
 
-    content = ""
+    content = response.choices[0].message.content or "" if response.choices else ""
     usage = {}
-    if "choices" in data and len(data["choices"]) > 0:
-        msg = data["choices"][0].get("message", {})
-        content = msg.get("content", "")
-    if "usage" in data:
-        usage = data["usage"]
+    if response.usage:
+        usage = {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+            "total_tokens": response.usage.total_tokens,
+        }
 
     return {
         "content": content,
-        "model": data.get("model", endpoint_name),
+        "model": response.model or endpoint_name,
         "usage": usage,
     }

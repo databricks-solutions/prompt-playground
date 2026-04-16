@@ -26,6 +26,10 @@ from server.routes.setup import router as setup_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Prompt Playground starting up...")
+    # Enable OpenAI autologging so every call_model() invocation automatically
+    # produces MLflow traces with token usage, latencies, and structured spans.
+    import mlflow
+    mlflow.openai.autolog()
     yield
     logger.info("Prompt Playground shutting down...")
 

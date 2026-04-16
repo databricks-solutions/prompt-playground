@@ -11,6 +11,7 @@ Covers:
 
 import pytest
 from unittest.mock import patch, AsyncMock, MagicMock
+from openai import APIStatusError, APITimeoutError
 from server.llm import call_model, EvalAbortError, TokenLimitError, RateLimitError
 
 
@@ -18,38 +19,33 @@ from server.llm import call_model, EvalAbortError, TokenLimitError, RateLimitErr
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_mock_session(status: int, body: str):
-    """Build a mock aiohttp session that returns a response with given status and body."""
-    mock_response = AsyncMock()
-    mock_response.status = status
-    mock_response.text = AsyncMock(return_value=body)
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
-
-    mock_session = MagicMock()
-    mock_session.post.return_value = mock_response
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-    return mock_session
+def _make_api_status_error(status_code: int, message: str) -> APIStatusError:
+    """Build an APIStatusError that mimics what the OpenAI SDK raises."""
+    mock_response = MagicMock()
+    mock_response.status_code = status_code
+    mock_response.headers = {}
+    mock_response.json.return_value = {"error": {"message": message}}
+    return APIStatusError(message=message, response=mock_response, body={"error": {"message": message}})
 
 
-def _make_success_session(content: str = "hello", model: str = "test-model"):
-    """Build a mock aiohttp session that returns a successful 200 response."""
-    mock_response = AsyncMock()
-    mock_response.status = 200
-    mock_response.json = AsyncMock(return_value={
-        "choices": [{"message": {"content": content}}],
-        "model": model,
-        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
-    })
-    mock_response.__aenter__ = AsyncMock(return_value=mock_response)
-    mock_response.__aexit__ = AsyncMock(return_value=False)
+def _make_success_response(content: str = "hello", model: str = "test-model"):
+    """Build a mock ChatCompletion response object."""
+    mock_message = MagicMock()
+    mock_message.content = content
 
-    mock_session = MagicMock()
-    mock_session.post.return_value = mock_response
-    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-    mock_session.__aexit__ = AsyncMock(return_value=False)
-    return mock_session
+    mock_choice = MagicMock()
+    mock_choice.message = mock_message
+
+    mock_usage = MagicMock()
+    mock_usage.prompt_tokens = 10
+    mock_usage.completion_tokens = 5
+    mock_usage.total_tokens = 15
+
+    mock_response = MagicMock()
+    mock_response.choices = [mock_choice]
+    mock_response.model = model
+    mock_response.usage = mock_usage
+    return mock_response
 
 
 @pytest.fixture(autouse=True)
@@ -58,6 +54,14 @@ def _patch_config(monkeypatch):
     with patch("server.llm.get_workspace_host", return_value="https://test.databricks.com"), \
          patch("server.llm.get_oauth_token", return_value="test-token"):
         yield
+
+
+def _patch_openai_create(side_effect=None, return_value=None):
+    """Patch the AsyncOpenAI client's chat.completions.create method."""
+    mock_client = MagicMock()
+    mock_create = AsyncMock(side_effect=side_effect, return_value=return_value)
+    mock_client.chat.completions.create = mock_create
+    return patch("server.llm._get_openai_client", return_value=mock_client)
 
 
 # ---------------------------------------------------------------------------
@@ -92,23 +96,22 @@ class TestRateLimitDetection:
 
     @pytest.mark.asyncio
     async def test_raises_rate_limit_error_on_429(self):
-        session = _make_mock_session(429, '{"error_code":"RATE_LIMIT","message":"too many requests"}')
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(429, "too many requests")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(RateLimitError):
                 await call_model("test-endpoint", "hello")
 
     @pytest.mark.asyncio
     async def test_raises_rate_limit_error_on_request_limit_exceeded_body(self):
-        body = '{"error_code":"REQUEST_LIMIT_EXCEEDED","message":"Exceeded workspace input tokens per minute rate limit"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "REQUEST_LIMIT_EXCEEDED: Exceeded workspace input tokens per minute rate limit")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(RateLimitError):
                 await call_model("test-endpoint", "hello")
 
     @pytest.mark.asyncio
     async def test_rate_limit_error_message_is_user_friendly(self):
-        session = _make_mock_session(429, '{"message":"rate exceeded"}')
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(429, "rate exceeded")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(RateLimitError) as exc_info:
                 await call_model("test-endpoint", "hello")
         assert "rate limit" in str(exc_info.value).lower()
@@ -116,8 +119,8 @@ class TestRateLimitDetection:
     @pytest.mark.asyncio
     async def test_rate_limit_is_eval_abort_error(self):
         """RateLimitError must be catchable as EvalAbortError for fast-fail to work."""
-        session = _make_mock_session(429, '{}')
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(429, "rate exceeded")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(EvalAbortError):
                 await call_model("test-endpoint", "hello")
 
@@ -130,33 +133,29 @@ class TestTokenLimitDetection:
 
     @pytest.mark.asyncio
     async def test_raises_token_limit_error_on_context_length_exceeded(self):
-        body = '{"error_code":"BAD_REQUEST","message":"context_length_exceeded: prompt too long"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "context_length_exceeded: prompt too long")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(TokenLimitError):
                 await call_model("test-endpoint", "hello")
 
     @pytest.mark.asyncio
     async def test_raises_token_limit_error_on_context_window_phrase(self):
-        body = '{"message":"This model has a context window of 8192 tokens"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "This model has a context window of 8192 tokens")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(TokenLimitError):
                 await call_model("test-endpoint", "hello")
 
     @pytest.mark.asyncio
     async def test_raises_token_limit_error_on_max_tokens_phrase(self):
-        body = '{"message":"Input exceeds max tokens allowed"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "Input exceeds max tokens allowed")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(TokenLimitError):
                 await call_model("test-endpoint", "hello")
 
     @pytest.mark.asyncio
     async def test_token_limit_error_message_is_user_friendly(self):
-        body = '{"message":"context_length_exceeded"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "context_length_exceeded")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(TokenLimitError) as exc_info:
                 await call_model("test-endpoint", "hello")
         assert "context window" in str(exc_info.value).lower()
@@ -164,10 +163,19 @@ class TestTokenLimitDetection:
     @pytest.mark.asyncio
     async def test_token_limit_is_eval_abort_error(self):
         """TokenLimitError must be catchable as EvalAbortError for fast-fail to work."""
-        body = '{"message":"context_length_exceeded"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "context_length_exceeded")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(EvalAbortError):
+                await call_model("test-endpoint", "hello")
+
+    @pytest.mark.asyncio
+    async def test_raises_token_limit_error_on_timeout(self):
+        """APITimeoutError should map to TokenLimitError."""
+        mock_request = MagicMock()
+        mock_request.url = "https://test.databricks.com/serving-endpoints/test-endpoint/invocations"
+        error = APITimeoutError(request=mock_request)
+        with _patch_openai_create(side_effect=error):
+            with pytest.raises(TokenLimitError):
                 await call_model("test-endpoint", "hello")
 
 
@@ -179,18 +187,16 @@ class TestGenericErrors:
 
     @pytest.mark.asyncio
     async def test_generic_500_raises_plain_exception(self):
-        body = '{"message":"Internal server error"}'
-        session = _make_mock_session(500, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(500, "Internal server error")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(Exception) as exc_info:
                 await call_model("test-endpoint", "hello")
         assert not isinstance(exc_info.value, EvalAbortError)
 
     @pytest.mark.asyncio
     async def test_generic_400_raises_plain_exception(self):
-        body = '{"message":"Invalid request format"}'
-        session = _make_mock_session(400, body)
-        with patch("aiohttp.ClientSession", return_value=session):
+        error = _make_api_status_error(400, "Invalid request format")
+        with _patch_openai_create(side_effect=error):
             with pytest.raises(Exception) as exc_info:
                 await call_model("test-endpoint", "hello")
         assert not isinstance(exc_info.value, EvalAbortError)
@@ -204,8 +210,8 @@ class TestSuccessfulResponse:
 
     @pytest.mark.asyncio
     async def test_returns_content_model_usage_on_200(self):
-        session = _make_success_session(content="test response", model="databricks-claude")
-        with patch("aiohttp.ClientSession", return_value=session):
+        response = _make_success_response(content="test response", model="databricks-claude")
+        with _patch_openai_create(return_value=response):
             result = await call_model("test-endpoint", "prompt")
         assert result["content"] == "test response"
         assert result["model"] == "databricks-claude"

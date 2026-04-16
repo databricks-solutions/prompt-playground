@@ -442,11 +442,10 @@ class TestGuardrails:
 # ---------------------------------------------------------------------------
 
 class TestLinkedPromptsTag:
-    """Verify the mlflow.linkedPrompts trace tag is set correctly.
+    """Verify prompt version linking to traces works correctly.
 
-    The REST API LinkPromptVersionsToTraces does not populate the trace tag
-    read by the Databricks UI, so we set it manually via set_trace_tag.
-    See: https://databricks.slack.com/archives/C083A8HQC6N/p1765414094281199
+    Uses link_prompt_versions_to_trace via the MLflow client to link
+    prompt versions to traces so they appear in the Databricks Traces UI.
     """
 
     def _run_registry(self, client, mock_client=None):
@@ -458,12 +457,16 @@ class TestLinkedPromptsTag:
         }
         if mock_client is None:
             mock_client = MagicMock()
+        mock_pv = MagicMock()
+        mock_client.get_prompt_version.return_value = mock_pv
         payload = {
             "prompt_name": "main.prompts.test",
             "prompt_version": "1",
             "model_name": "databricks-test-model",
             "variables": {"name": "Alice"},
         }
+        mock_span = MagicMock()
+        mock_span.request_id = "test-trace-id"
         with (
             patch("server.routes.run.get_prompt_template", return_value=mock_template),
             patch("server.routes.run.configure_mlflow"),
@@ -473,24 +476,29 @@ class TestLinkedPromptsTag:
             patch("server.routes.run.mlflow") as mock_mlflow,
         ):
             _mock_mlflow(mock_mlflow)
+            mock_mlflow.get_current_active_span.return_value = mock_span
             resp = client.post("/api/run", json=payload)
         return resp, mock_client
 
-    def test_registry_prompt_sets_linked_prompts_tag(self, client):
-        """set_trace_tag is called with mlflow.linkedPrompts and correct JSON for registry prompts."""
-        import json
+    def test_registry_prompt_links_to_trace(self, client):
+        """link_prompt_versions_to_trace is called for registry prompts."""
         mock_client = MagicMock()
+        mock_pv = MagicMock()
+        mock_client.get_prompt_version.return_value = mock_pv
         resp, _ = self._run_registry(client, mock_client)
         assert resp.status_code == 200
 
-        mock_client.set_trace_tag.assert_called_once_with(
-            "test-trace-id",
-            "mlflow.linkedPrompts",
-            json.dumps([{"name": "main.prompts.test", "version": "1"}]),
+        mock_client.get_prompt_version.assert_any_call(
+            name="main.prompts.test",
+            version="1",
         )
+        mock_client.link_prompt_versions_to_trace.assert_called_once()
+        call_kwargs = mock_client.link_prompt_versions_to_trace.call_args
+        assert call_kwargs.kwargs["trace_id"] == "test-trace-id"
+        assert len(call_kwargs.kwargs["prompt_versions"]) == 1
 
-    def test_draft_prompt_does_not_set_linked_prompts_tag(self, client):
-        """Draft templates skip the trace tag — no prompt version to link."""
+    def test_draft_prompt_does_not_link_to_trace(self, client):
+        """Draft templates skip prompt linking — no prompt version to link."""
         mock_client = MagicMock()
         with (
             patch("server.routes.run.configure_mlflow"),
@@ -507,12 +515,13 @@ class TestLinkedPromptsTag:
                 "draft_template": "A draft prompt.",
             })
         assert resp.status_code == 200
-        mock_client.set_trace_tag.assert_not_called()
+        mock_client.link_prompt_versions_to_trace.assert_not_called()
 
-    def test_set_trace_tag_failure_is_non_fatal(self, client):
-        """If set_trace_tag raises, the run still succeeds and returns 200."""
+    def test_link_prompt_versions_failure_is_non_fatal(self, client):
+        """If link_prompt_versions_to_trace raises, the run still succeeds."""
         mock_client = MagicMock()
-        mock_client.set_trace_tag.side_effect = Exception("trace tag error")
+        mock_client.get_prompt_version.return_value = MagicMock()
+        mock_client.link_prompt_versions_to_trace.side_effect = Exception("link error")
         resp, _ = self._run_registry(client, mock_client)
         assert resp.status_code == 200
         assert resp.json()["response"] == "Model response."
