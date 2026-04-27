@@ -1,11 +1,12 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import type { ModelEndpoint } from '../types';
 import { apiFetch } from './useApi';
 
 export function useModels() {
   const [models, setModels] = useState<ModelEndpoint[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const fetchedRef = useRef(false);
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -13,6 +14,7 @@ export function useModels() {
     try {
       const data = await apiFetch<{ models: ModelEndpoint[] }>('/models');
       setModels(data.models);
+      fetchedRef.current = true;
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -20,9 +22,9 @@ export function useModels() {
     }
   }, []);
 
-  useEffect(() => {
-    refresh();
+  const ensureLoaded = useCallback(() => {
+    if (!fetchedRef.current) refresh();
   }, [refresh]);
 
-  return { models, loading, error, refresh };
+  return { models, loading, error, refresh, ensureLoaded };
 }

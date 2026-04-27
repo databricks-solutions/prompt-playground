@@ -98,6 +98,7 @@ export default function App() {
     loading: modelsLoading,
     error: modelsError,
     refresh: refreshModels,
+    ensureLoaded: ensureModelsLoaded,
   } = useModels();
   const { experiments, loading: experimentsLoading } = useExperiments();
   const { promptNames: experimentPromptNames, loading: experimentPromptsLoading, refresh: refreshExperimentPrompts } = useExperimentPrompts(experimentName, activeCatalog, activeSchema);
@@ -158,7 +159,8 @@ export default function App() {
     setVariableValues({});
     setShowDiff(false);
     editor.exitEdit();
-  }, [editor.isDirty, editor.exitEdit, resetVersions]);
+    if (name) ensureModelsLoaded();
+  }, [editor.isDirty, editor.exitEdit, resetVersions, ensureModelsLoaded]);
 
   const handleTabChange = useCallback((tab: Tab) => {
     if (editor.isDirty) {
