@@ -17,7 +17,7 @@ Covers:
 
 import pytest
 from contextlib import contextmanager, ExitStack
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, AsyncMock, MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -54,14 +54,12 @@ _MODEL_RESULT = {"content": "response", "model": "m", "usage": {}}
 @contextmanager
 def _eval_patches(rows, extra_patches=()):
     """Context manager providing all patches needed for POST /api/eval/run without workspace calls."""
-    num_rows = len(rows) if rows else 1
     patches = [
         patch("server.routes.evaluate._get_warehouse_id", return_value="test-warehouse-id"),
         patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_DATA),
         patch("server.routes.evaluate.read_table_rows", return_value=rows),
-        patch("server.routes.evaluate.mlflow_genai_evaluate",
-              return_value=("run-id", {i: (None, None, None) for i in range(num_rows)},
-                            ["response"] * num_rows)),
+        patch("server.routes.evaluate.call_model", new=AsyncMock(return_value=_MODEL_RESULT)),
+        patch("server.routes.evaluate.mlflow_genai_evaluate", return_value=("run-id", {0: (None, None, None)})),
         patch("server.routes.evaluate.configure_mlflow"),
         patch("server.routes.evaluate.get_experiment_id", return_value=None),
         patch("server.routes.evaluate.make_experiment_url", return_value=None),
@@ -121,24 +119,24 @@ class TestEvalColumnPreflight:
         # Both missing columns should be mentioned
         assert "col_a" in detail and "col_b" in detail
 
-    def test_missing_column_blocks_evaluate(self, client):
-        """mlflow_genai_evaluate must NOT be called when pre-flight fails."""
+    def test_missing_column_blocks_call_model(self, client):
+        """call_model must NOT be called when pre-flight fails."""
         rows = [{"wrong_col": "val"}]
-        mock_evaluate = MagicMock()
+        mock_call = AsyncMock(return_value=_MODEL_RESULT)
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "missing_col"}}
 
         with (
             patch("server.routes.evaluate._get_warehouse_id", return_value="test-warehouse-id"),
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_DATA),
             patch("server.routes.evaluate.read_table_rows", return_value=rows),
-            patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate),
+            patch("server.routes.evaluate.call_model", new=mock_call),
             patch("server.routes.evaluate.configure_mlflow"),
             patch("server.routes.evaluate.get_experiment_id", return_value=None),
         ):
             resp = client.post("/api/eval/run", json=payload)
 
         assert resp.status_code == 400
-        mock_evaluate.assert_not_called()
+        mock_call.assert_not_called()
 
     def test_all_columns_present_passes_preflight(self, client):
         """When all mapped columns exist, pre-flight passes and eval proceeds."""
@@ -298,8 +296,6 @@ class TestEvalRunResponse:
 
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_NO_SYSTEM),
-            patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None)}, ["response"])),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 
@@ -314,8 +310,6 @@ class TestEvalRunResponse:
 
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
-            patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None)}, ["response"])),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 
@@ -330,8 +324,6 @@ class TestEvalRunResponse:
 
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
-            patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None)}, ["response"])),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 
@@ -345,8 +337,6 @@ class TestEvalRunResponse:
 
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
-            patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None)}, ["response"])),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 
@@ -365,8 +355,7 @@ class TestEvalRunResponse:
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
             patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None), 1: (None, None, None)},
-                                ["response1", "response2"])),
+                  return_value=("run-id", {0: (None, None, None), 1: (None, None, None)})),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 
@@ -380,11 +369,10 @@ class TestEvalRunResponse:
         rows = [{"topic_col": "test"}]
         payload = {**_BASE_EVAL_PAYLOAD}
 
+        # Prompt data with no system_prompt key at all
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template",
                   return_value={"template": "{{topic}}", "variables": ["topic"]}),
-            patch("server.routes.evaluate.mlflow_genai_evaluate",
-                  return_value=("run-id", {0: (None, None, None)}, ["response"])),
         ]):
             resp = client.post("/api/eval/run", json=payload)
 

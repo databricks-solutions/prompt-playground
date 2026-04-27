@@ -1,18 +1,14 @@
 """MLflow GenAI evaluation orchestration.
 
-Runs mlflow.genai.evaluate() with a predict_fn so that model calls happen
-inside evaluate's tracing context.  Combined with mlflow.openai.autolog(),
-each eval trace automatically captures token usage, latencies, and model params.
+Runs mlflow.genai.evaluate() with pre-computed model outputs, logs metadata,
+links prompt versions, and extracts per-row scores from evaluation traces.
 """
 
-import asyncio
 import re
 import logging
 import mlflow
 import mlflow.genai
-from mlflow.genai.scorers import Scorer
 from server.scoring import QualityScorer
-from server.llm import call_model, EvalAbortError
 from server.mlflow_helpers import configure_mlflow, get_mlflow_client, EXPERIMENT_NAME
 
 logger = logging.getLogger(__name__)
@@ -31,8 +27,8 @@ RowScore = tuple[float | str | None, str | None, list[dict] | None]
 
 
 def mlflow_genai_evaluate(
-    eval_rows: list[dict],
-    predict_config: dict,
+    row_data: list[tuple[dict, str, str]],  # (variables, rendered, response_text)
+    model_name: str,
     run_name: str,
     prompt_name: str,
     prompt_version: str,
@@ -41,185 +37,55 @@ def mlflow_genai_evaluate(
     scorer_name: str | None = None,
     judge_model: str | None = None,
     judge_temperature: float = 0.0,
-) -> tuple[str | None, dict[int, RowScore], list[str]]:
-    """Run mlflow.genai.evaluate() with a predict_fn that calls the model.
+    expectations_data: list[str | None] | None = None,
+) -> tuple[str | None, dict[int, RowScore]]:
+    """Run mlflow.genai.evaluate(), link prompt version, extract per-row scores.
 
-    eval_rows: list of dicts with keys "request", "system_prompt" (optional),
-               and optionally "expected_response".
-    predict_config: dict with "model_name" and "temperature".
-
-    Returns (run_id, row_scores, responses) where:
-      - row_scores maps row_index -> (score, rationale, details)
-      - responses is the list of model response strings in row order
+    Returns (run_id, row_scores) where row_scores maps row_index -> (score, rationale, details).
+    details is a list of per-guideline dicts for Guidelines judges, None otherwise.
     """
     configure_mlflow()
     exp_name = experiment_name or EXPERIMENT_NAME
     mlflow.set_experiment(exp_name)
 
-    model_name = predict_config["model_name"]
-    temperature = predict_config["temperature"]
-
-    # Collect responses as predict_fn runs so the route can return them.
-    # Track row index via a counter instead of embedding _row_index in the
-    # eval_data inputs — that would leak a synthetic field into MLflow traces.
-    responses: list[str | None] = [None] * len(eval_rows)
-    _predict_call_counter = iter(range(len(eval_rows)))
-
-    def predict_fn(request: str, system_prompt: str | None = None) -> str:
-        """Sync predict function for evaluate() — calls model via OpenAI SDK.
-
-        evaluate() runs this in a ThreadPoolExecutor (default 10 workers),
-        and autologging captures token usage on each trace.
-        Parameter names must match the keys in the eval_data "inputs" dicts.
-        """
-        row_idx = next(_predict_call_counter, None)
-
-        loop = asyncio.new_event_loop()
-        try:
-            result = loop.run_until_complete(
-                call_model(
-                    endpoint_name=model_name,
-                    prompt=request,
-                    temperature=temperature,
-                    system_prompt=system_prompt,
-                )
-            )
-            response_text = result["content"]
-        except EvalAbortError:
-            raise
-        except Exception as e:
-            response_text = f"[ERROR: {e}]"
-        finally:
-            loop.close()
-
-        if row_idx is not None:
-            responses[row_idx] = response_text
-        return response_text
-
-    # Build eval dataset in MLflow 3 GenAI format
+    # Build eval dataset in correct MLflow 3 GenAI format
     eval_data = []
-    for idx, row in enumerate(eval_rows):
+    for idx, (_, rendered, response_text) in enumerate(row_data):
         entry: dict = {
-            "inputs": {
-                "request": row["request"],
-            },
+            "inputs": {"request": rendered},
+            "outputs": {"response": response_text},
         }
-        if row.get("system_prompt"):
-            entry["inputs"]["system_prompt"] = row["system_prompt"]
-        if row.get("expected_response"):
-            entry["expectations"] = {"expected_response": row["expected_response"]}
+        if expectations_data and idx < len(expectations_data) and expectations_data[idx]:
+            entry["expectations"] = {"expected_response": expectations_data[idx]}
         eval_data.append(entry)
 
+    # Use a registered MLflow judge if specified, otherwise fall back to built-in quality scorer
     scorers = _resolve_scorers(scorer_name, model_name, judge_model, judge_temperature)
 
-    # Wrap scorers to capture per-row scores in memory.  With UC-backed trace
-    # experiments, result_df is often None and search_traces may fail, so this
-    # in-memory capture is the most reliable way to get per-row scores.
-    captured_scores: dict[int, RowScore] = {}
-    scorers = _wrap_scorers_for_capture(scorers, captured_scores, len(eval_rows))
-
     try:
-        eval_result = mlflow.genai.evaluate(
-            data=eval_data,
-            predict_fn=predict_fn,
-            scorers=scorers,
-        )
+        eval_result = mlflow.genai.evaluate(data=eval_data, scorers=scorers)
         run_id = eval_result.run_id
     except Exception as e:
         logger.warning("mlflow.genai.evaluate failed: %s", e)
-        # Collect any responses that were produced before failure
-        return None, {}, [r or "[ERROR: evaluate failed]" for r in responses]
+        return None, {}
 
-    _log_run_metadata(run_id, run_name, prompt_name, prompt_version, model_name, scorer_name, dataset, len(eval_rows))
+    _log_run_metadata(run_id, run_name, prompt_name, prompt_version, model_name, scorer_name, dataset, len(row_data))
     _link_prompt_version(run_id, prompt_name, prompt_version)
-    _link_prompt_to_traces(run_id, prompt_name, prompt_version)
     _log_dataset_input(run_id, dataset)
 
     expected_name = scorer_name or "response_quality"
 
-    # Primary: use scores captured in memory during evaluation
-    row_scores = captured_scores
-    if not row_scores:
-        # Fallback 1: extract from result_df (works for non-UC experiments)
-        row_scores = _extract_scores_from_result(eval_result, expected_name)
+    # Primary: extract from eval_result directly
+    row_scores = _extract_scores_from_result(eval_result, expected_name)
+    # Always also try trace path if we have no per-guideline details yet —
+    # result_df only has aggregated scores; per-rule rationale lives in trace assessments
     has_details = any(rs[2] is not None for rs in row_scores.values())
     if not row_scores or not has_details:
-        # Fallback 2: extract from traces
         trace_scores = _extract_row_scores(run_id, expected_name)
         if trace_scores:
             row_scores = trace_scores
 
-    return run_id, row_scores, [r or "[ERROR: no response]" for r in responses]
-
-
-class _CapturingScorer(Scorer):
-    """Wraps an MLflow scorer to capture per-row scores in memory.
-
-    With UC-backed trace experiments (MLflow 3.10+), result_df is often None
-    and search_traces may fail. Capturing scores in memory during evaluation
-    is the most reliable way to get per-row results.
-
-    Row index is tracked via an internal counter rather than reading a
-    synthetic field from inputs, so no bookkeeping data leaks into traces.
-
-    Uses object.__setattr__ to store _inner, _captured, and _counter because
-    Scorer is a Pydantic BaseModel that rejects undeclared fields.
-    """
-
-    name: str = "capturing_scorer"
-
-    def __init__(self, inner, captured: dict[int, RowScore], num_rows: int):
-        super().__init__(name=getattr(inner, 'name', 'scorer'))
-        object.__setattr__(self, '_inner', inner)
-        object.__setattr__(self, '_captured', captured)
-        object.__setattr__(self, '_counter', iter(range(num_rows)))
-
-    def run(self, *, inputs=None, outputs=None, expectations=None, trace=None, session=None):
-        """Override run() to intercept scorer results.
-
-        evaluate() calls scorer.run(), which inspects __call__'s signature
-        and delegates. We override run() directly to capture results.
-        """
-        from mlflow.entities import Feedback
-        result = self._inner.run(
-            inputs=inputs, outputs=outputs, expectations=expectations,
-            trace=trace, session=session,
-        )
-
-        # Derive row index from call order
-        row_idx = next(self._counter, None)
-        if row_idx is None:
-            return result
-
-        # Parse Feedback result into RowScore format
-        if isinstance(result, Feedback):
-            score_val = result.value
-            if isinstance(score_val, str):
-                score_val = _normalize_pass_fail(score_val)
-            self._captured[int(row_idx)] = (score_val, result.rationale, None)
-        elif isinstance(result, list):
-            # Guidelines scorer returns a list of Feedback objects
-            details = []
-            for fb in result:
-                if isinstance(fb, Feedback):
-                    val = fb.value
-                    if isinstance(val, str):
-                        val = _normalize_pass_fail(val)
-                    details.append({"name": fb.name, "value": val, "rationale": fb.rationale})
-            if details:
-                passes = sum(1 for d in details if _is_pass(d["value"]))
-                self._captured[int(row_idx)] = (f"{passes}/{len(details)}", None, details)
-
-        return result
-
-    def __call__(self, **kwargs):
-        # Needed to satisfy Scorer ABC; run() is what evaluate() actually calls
-        return self._inner(**kwargs)
-
-
-def _wrap_scorers_for_capture(scorers: list, captured: dict[int, RowScore], num_rows: int) -> list:
-    """Wrap each scorer in a _CapturingScorer to capture per-row scores in memory."""
-    return [_CapturingScorer(s, captured, num_rows) for s in scorers]
+    return run_id, row_scores
 
 
 def _resolve_scorers(scorer_name: str | None, model_name: str, judge_model: str | None = None, judge_temperature: float = 0.0) -> list:
@@ -282,26 +148,6 @@ def _link_prompt_version(run_id: str, prompt_name: str, prompt_version: str) -> 
         client.link_prompt_version_to_run(run_id=run_id, prompt=pv)
     except Exception as e:
         logger.warning("link_prompt_version_to_run failed (non-fatal): %s", e)
-
-
-def _link_prompt_to_traces(run_id: str, prompt_name: str, prompt_version: str) -> None:
-    """Link prompt version to each trace in the eval run for the Traces UI."""
-    client = get_mlflow_client()
-    try:
-        pv = client.get_prompt_version(name=prompt_name, version=prompt_version)
-        traces = mlflow.search_traces(run_id=run_id, return_type="list")
-        for trace in traces:
-            trace_id = trace.info.request_id if hasattr(trace, 'info') else None
-            if trace_id:
-                try:
-                    client.link_prompt_versions_to_trace(
-                        prompt_versions=[pv],
-                        trace_id=trace_id,
-                    )
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.warning("link_prompt_to_traces failed (non-fatal): %s", e)
 
 
 _PASS_STRINGS = frozenset({
