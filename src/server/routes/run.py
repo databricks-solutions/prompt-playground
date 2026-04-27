@@ -1,6 +1,7 @@
 """API routes for running prompts against models."""
 
 import re
+import json
 import logging
 import mlflow
 from fastapi import APIRouter, HTTPException
@@ -141,23 +142,33 @@ async def api_run_prompt(request: RunRequest):
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Model call failed: {e}")
 
-            # Link prompt version to the trace so it appears in the
-            # "Linked prompts" tab in the Databricks Traces UI.
+            # Set request/response previews on the trace so they show in the
+            # Traces UI columns (autolog doesn't populate these).
+            try:
+                mlflow.update_current_trace(
+                    request_preview=rendered[:200],
+                    response_preview=result["content"][:200],
+                )
+            except Exception:
+                pass
+
+            # Set the mlflow.linkedPrompts trace tag so the prompt version
+            # appears in the Prompt column of the Traces UI.
+            # The REST API (link_prompt_versions_to_trace) does not populate
+            # this tag, so we must set it manually.
             if request.draft_template is None:
                 try:
-                    client = get_mlflow_client()
-                    pv = client.get_prompt_version(
-                        name=request.prompt_name,
-                        version=request.prompt_version,
-                    )
-                    active_trace = mlflow.get_current_active_span()
-                    if active_trace:
-                        client.link_prompt_versions_to_trace(
-                            prompt_versions=[pv],
-                            trace_id=active_trace.request_id,
+                    prompt_link = json.dumps([{
+                        "name": request.prompt_name,
+                        "version": request.prompt_version,
+                    }])
+                    active_span = mlflow.get_current_active_span()
+                    if active_span:
+                        get_mlflow_client().set_trace_tag(
+                            active_span.request_id, "mlflow.linkedPrompts", prompt_link
                         )
                 except Exception as e:
-                    logger.warning("link_prompt_versions_to_trace failed (non-fatal): %s", e)
+                    logger.warning("set_trace_tag mlflow.linkedPrompts failed (non-fatal): %s", e)
 
             _log_run_artifacts(run.info.run_id, rendered, rendered_system, result, request)
 
