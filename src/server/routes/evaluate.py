@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from server.mlflow_client import get_prompt_template, list_prompts
 from server.templates import render_template, parse_system_user
 from server.mlflow_helpers import configure_mlflow, get_experiment_id, experiment_url as make_experiment_url, get_mlflow_client, EXPERIMENT_NAME
-from server.llm import call_model, EvalAbortError, TokenLimitError, RateLimitError
+from server.llm import EvalAbortError, TokenLimitError, RateLimitError
 from server.warehouse import list_eval_tables, get_table_columns, read_table_rows, count_table_rows
 from server.evaluation import mlflow_genai_evaluate, _extract_row_scores
 from server.settings import get_effective_config
@@ -487,101 +487,76 @@ async def api_run_evaluation(request: EvalRequest):
 
     system_prompt_raw = prompt_data.get("system_prompt")
 
-    # Run model against each row concurrently (max 10 in-flight at once)
-    sem = asyncio.Semaphore(10)
+    # Build eval rows with rendered prompts — evaluate() will call the model
+    # via predict_fn so autologging captures token usage on each trace.
+    eval_rows = []
+    row_variables: list[dict[str, str]] = []
+    rendered_prompts: list[str] = []
+    rendered_systems: list[str | None] = []
 
-    async def run_row(i: int, row: dict) -> tuple:
+    for row in rows:
         variables = {
             var: str(row.get(col, "")) for var, col in request.column_mapping.items()
         }
         rendered = render_template(prompt_data["template"], variables)
         rendered_system = render_template(system_prompt_raw, variables) if system_prompt_raw else None
-        expectations_val = (
-            str(row.get(request.expectations_column, "")) if request.expectations_column else None
-        )
-        async with sem:
-            try:
-                model_result = await call_model(
-                    endpoint_name=request.model_name,
-                    prompt=rendered,
-                    temperature=request.temperature,
-                    system_prompt=rendered_system,
-                )
-                response_text = model_result["content"]
-            except EvalAbortError:
-                raise  # propagate to abort the entire eval
-            except Exception as e:
-                response_text = f"[ERROR: {e}]"
-        return (i, variables, rendered, rendered_system, response_text, expectations_val)
 
-    try:
-        results_raw = await asyncio.gather(*[run_row(i, row) for i, row in enumerate(rows)])
-    except TokenLimitError as e:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"{e} Consider reducing the prompt length or the Max Rows setting "
-                "to stay within the model's context window."
-            ),
-        )
-    except RateLimitError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    sorted_results = sorted(results_raw)
-    row_data: list[tuple[dict, str, str]] = [
-        (variables, rendered, response_text)
-        for _, variables, rendered, _sys, response_text, _ in sorted_results
-    ]
-    rendered_systems: list[str | None] = [
-        _sys for _, _, _, _sys, _, _ in sorted_results
-    ]
-    expectations_data: list[str | None] | None = (
-        [expectations_val for _, _, _, _, _, expectations_val in sorted_results]
-        if request.expectations_column else None
-    )
+        eval_entry: dict = {"request": rendered}
+        if rendered_system:
+            eval_entry["system_prompt"] = rendered_system
+        if request.expectations_column:
+            eval_entry["expected_response"] = str(row.get(request.expectations_column, ""))
 
-    # Skip mlflow evaluation if all rows errored (nothing useful to score)
-    all_errored = all(resp.startswith("[ERROR:") for _, _, resp in row_data)
+        eval_rows.append(eval_entry)
+        row_variables.append(variables)
+        rendered_prompts.append(rendered)
+        rendered_systems.append(rendered_system)
 
-    # Run mlflow.genai.evaluate() in a thread (all MLflow calls are synchronous)
+    # Run mlflow.genai.evaluate() with predict_fn — model calls happen inside
+    # evaluate's tracing context so autologging captures token usage per trace.
     run_id = None
     exp_url = None
     row_scores: dict[int, tuple[float | str | None, str | None]] = {}
-    if all_errored:
-        logger.warning("All %d rows errored — skipping mlflow_genai_evaluate", len(row_data))
-    else:
-        try:
-            run_name = f"eval-{request.prompt_name.split('.')[-1]}-v{request.prompt_version}"
-            run_id, row_scores = await asyncio.to_thread(
-                mlflow_genai_evaluate,
-                row_data,
-                request.model_name,
-                run_name,
-                request.prompt_name,
-                request.prompt_version,
-                dataset_full_name,
-                request.experiment_name,
-                request.scorer_name,
-                request.judge_model,
-                request.judge_temperature,
-                expectations_data,
-            )
-            if run_id:
-                exp_id = get_experiment_id(request.experiment_name)
-                if exp_id:
-                    exp_url = make_experiment_url(exp_id)
-        except Exception as e:
-            logger.warning("MLflow eval failed (non-fatal): %s", e)
+    responses: list[str] = [""] * len(eval_rows)
+
+    try:
+        run_name = f"eval-{request.prompt_name.split('.')[-1]}-v{request.prompt_version}"
+        predict_config = {
+            "model_name": request.model_name,
+            "temperature": request.temperature,
+        }
+        run_id, row_scores, responses = await asyncio.to_thread(
+            mlflow_genai_evaluate,
+            eval_rows,
+            predict_config,
+            run_name,
+            request.prompt_name,
+            request.prompt_version,
+            dataset_full_name,
+            request.experiment_name,
+            request.scorer_name,
+            request.judge_model,
+            request.judge_temperature,
+        )
+        if run_id:
+            exp_id = get_experiment_id(request.experiment_name)
+            if exp_id:
+                exp_url = make_experiment_url(exp_id)
+    except EvalAbortError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.warning("MLflow eval failed (non-fatal): %s", e)
 
     # Build final results, merging in per-row scores extracted from traces
     results: list[EvalRowResult] = []
-    for i, (variables, rendered, response_text) in enumerate(row_data):
+    for i in range(len(eval_rows)):
         score, rationale, details = row_scores.get(i, (None, None, None))
         results.append(EvalRowResult(
             row_index=i,
-            variables=variables,
-            rendered_prompt=rendered,
-            rendered_system_prompt=rendered_systems[i] if i < len(rendered_systems) else None,
-            response=response_text,
+            variables=row_variables[i],
+            rendered_prompt=rendered_prompts[i],
+            rendered_system_prompt=rendered_systems[i],
+            response=responses[i] if i < len(responses) else "",
             score=score,
             score_rationale=rationale,
             score_details=[ScoreDetail(**d) for d in details] if details else None,

@@ -38,7 +38,7 @@ export function useExperimentPrompts(experimentName: string, catalog?: string, s
     if (schema) params.set('schema', schema);
     try {
       const d = await apiFetch<{ prompt_names: string[] }>(`/eval/experiments/prompts?${params.toString()}`);
-      setPromptNames(d.prompt_names.length > 0 ? d.prompt_names : null);
+      setPromptNames(d.prompt_names);
     } catch {
       setPromptNames(null);
     } finally {
