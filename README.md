@@ -1,20 +1,67 @@
 # Prompt Playground
 
-Prompt Playground is an interactive, no-code Databricks App for designing, testing, and evaluating prompts stored in the [Prompt Registry](https://docs.databricks.com/aws/en/mlflow3/genai/prompt-version-mgmt/prompt-registry/). It enables product owners, prompt engineers, and both technical and non-technical users to iterate on prompt templates, run them against live model serving endpoints, and evaluate quality at scale — without writing code.
+Prompt Playground is an interactive, no-code Databricks App for designing and testing prompts stored in the [Prompt Registry](https://docs.databricks.com/aws/en/mlflow3/genai/prompt-version-mgmt/prompt-registry/). It enables product owners, prompt engineers, and both technical and non-technical users to iterate on prompt templates and run them against live model serving endpoints — without writing code.
 
 - **Manage prompts** — browse, create, and version prompt templates directly from the UI
 - **Iterate interactively** — fill in `{{template_variables}}`, run against any model serving endpoint, and preview the fully rendered prompt before executing
-- **Evaluate at scale** — run a prompt version against any Unity Catalog Delta table, score with built-in LLM-as-judge presets or custom judges, and triage low-scoring results in-app
-- **Tightly integrated with Databricks** — every run and evaluation is logged as an MLflow trace with direct links to the Experiments UI; all data stays in your Unity Catalog environment
+- **Tightly integrated with Databricks** — playground runs are logged as MLflow traces with direct links to the Experiments UI; all data stays in your Unity Catalog environment
+- **Batch evaluation (optional)** — enable the experimental **Evaluate** tab in Settings to run prompts against Unity Catalog Delta tables with LLM-as-judge scoring (off by default)
 
 ## Installation
 
 ### Prerequisites
 
 - [Databricks CLI](https://docs.databricks.com/dev-tools/cli/install.html) `>= 0.220.0`, authenticated via `databricks auth login`
-- A **SQL Warehouse** running in your workspace
 - A **model serving endpoint** — [Foundation Model API](https://docs.databricks.com/machine-learning/foundation-models/index.html) endpoints work out of the box
-- The app's **service principal** must have `MANAGE` on the Unity Catalog schema where your prompts are stored, and `MANAGE` on the schema where eval results will be written
+- The app's **service principal** must have `USE CATALOG` / `USE SCHEMA` and `MANAGE` (or appropriate read/write) on the Unity Catalog schema where your prompts are registered
+
+**Additional prerequisites if you enable the Evaluate tab:**
+
+- A **SQL Warehouse** (used to read eval datasets)
+- `MANAGE` (or read access) on the schema where evaluation datasets live
+
+### Bundle configuration
+
+Bundle variables ship **empty by default** — each workspace admin picks catalog, schema, experiment, and (if needed) SQL warehouse in the in-app **Settings** panel after deploy. No SQL warehouse is required at deploy time.
+
+```yaml
+variables:
+  prompt_catalog:
+    default: ""
+  prompt_schema:
+    default: ""
+  evaluate_tab_enabled:
+    default: "false" # set "true" to show the experimental Evaluate tab
+  eval_catalog:
+    default: ""
+  eval_schema:
+    default: ""
+```
+
+Set **MLflow experiment** and **SQL warehouse** in Settings after deploy — they are not bundle variables.
+
+### Service principal permissions
+
+Grant the app's service principal (see **Compute → Apps → your app → Identity**) at minimum:
+
+| Resource | Privilege | Required for |
+|----------|-----------|--------------|
+| Prompt catalog | `USE CATALOG` | Prompts + Playground |
+| Prompt schema | `USE SCHEMA`, `CREATE FUNCTION`, `EXECUTE`, `MANAGE` | Browse/create prompts (`MANAGE` is not included in `ALL PRIVILEGES`) |
+| MLflow experiment | `CAN MANAGE` or create experiment | Playground traces |
+| Model serving endpoint | `CAN QUERY` (via bundle) | Running prompts |
+| Eval dataset catalog/schema | `USE CATALOG`, `USE SCHEMA`, `SELECT` on tables | Evaluate tab only |
+| SQL warehouse | `CAN USE` | Evaluate tab only (pick in Settings — not configured in the bundle) |
+
+Example SQL grants:
+
+```sql
+GRANT USE CATALOG ON CATALOG my_catalog TO `<service-principal-client-id>`;
+GRANT USE SCHEMA, CREATE FUNCTION, EXECUTE, MANAGE ON SCHEMA my_catalog.prompts TO `<service-principal-client-id>`;
+GRANT SELECT ON SCHEMA my_catalog.eval_data TO `<service-principal-client-id>`;
+```
+
+To hide legacy foundation models from the model dropdown, set `DEPRECATED_MODEL_ENDPOINTS` (comma-separated endpoint names) on the app.
 
 ### Setup
 
@@ -37,7 +84,7 @@ The app URL will be printed in the output. You can also find it under **Compute 
 
 ## Usage
 
-> **First time? Start here:** Open the app and check out the **How to Use** tab for a full walkthrough. Click the **Settings** icon in the upper right to configure your SQL Warehouse, prompt catalog/schema, and evaluation dataset catalog/schema.
+> **First time?** Open the **How to Use** tab for a walkthrough. Click **Settings** (gear icon) and set your **Prompt Registry** catalog and schema — that's all you need for Prompts and Playground. Enable **Show Evaluate tab** in Settings only if you want batch evaluation.
 
 **Register your first prompt from within the app:**
 
@@ -49,16 +96,19 @@ The app URL will be printed in the output. You can also find it under **Compute 
 ## Troubleshooting
 
 **App fails to start / "MANAGE privilege" error**
-→ The service principal is missing `MANAGE` on the prompts schema.
+→ The service principal is missing required privileges on the prompts schema.
 
 **"No prompts found"**
-→ Open Settings (upper right) and verify your prompt catalog and schema are correct. Confirm the app's service principal has access to that schema.
+→ Open Settings and verify your prompt catalog and schema. Confirm the app's service principal has access to that schema.
 
 **Eval datasets not loading**
-→ Open Settings and verify your evaluation dataset catalog and schema. Confirm the service principal has `MANAGE` on that schema.
+→ The Evaluate tab must be enabled in Settings. Verify eval catalog/schema and SQL warehouse, and confirm the service principal can read those tables.
 
 **Model endpoint not listed**
 → The endpoint may not be in `READY` state. Check **Serving > Endpoints** in your workspace.
+
+**Experiment dropdown is slow or empty**
+→ Set **MLflow experiment** in Settings (or leave blank and pick from the capped workspace browse list).
 
 ## How to get help
 

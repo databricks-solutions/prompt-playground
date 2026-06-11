@@ -127,4 +127,6 @@ export interface AppConfig {
   sql_warehouse_name: string;
   /** When false (default), the Evaluate tab is hidden in the UI. */
   evaluate_tab_enabled: boolean;
+  /** Server-computed readiness for Prompts + Playground (and Evaluate when enabled). */
+  is_configured?: boolean;
 }

@@ -8,9 +8,25 @@ import os
 import logging
 import mlflow
 from mlflow import MlflowClient
-from server.config import get_workspace_host, IS_DATABRICKS_APP
+from server.config import get_workspace_host, get_workspace_client, IS_DATABRICKS_APP
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_databricks_env_from_sdk() -> None:
+    """Align MLflow's env-based auth with the SDK workspace client (local dev)."""
+    if IS_DATABRICKS_APP:
+        return
+    if os.environ.get("DATABRICKS_HOST") and os.environ.get("DATABRICKS_TOKEN"):
+        return
+    try:
+        w = get_workspace_client()
+        if w.config.host:
+            os.environ.setdefault("DATABRICKS_HOST", w.config.host)
+        if w.config.token:
+            os.environ.setdefault("DATABRICKS_TOKEN", w.config.token)
+    except Exception as e:
+        logger.debug("Could not sync Databricks env from SDK: %s", e)
 
 
 def configured_mlflow_experiment_name() -> str:
@@ -26,6 +42,7 @@ def configure_mlflow():
         mlflow.set_tracking_uri("databricks")
         mlflow.set_registry_uri("databricks-uc")
     else:
+        _sync_databricks_env_from_sdk()
         profile = os.environ.get("DATABRICKS_PROFILE")
         mlflow.set_tracking_uri(f"databricks://{profile}" if profile else "databricks")
         mlflow.set_registry_uri("databricks-uc")

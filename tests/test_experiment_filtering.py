@@ -28,6 +28,15 @@ def client():
     return TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def clear_experiment_browse_cache():
+    from server.routes import evaluate as evaluate_module
+
+    evaluate_module._EXPERIMENT_BROWSE_CACHE.invalidate()
+    yield
+    evaluate_module._EXPERIMENT_BROWSE_CACHE.invalidate()
+
+
 def _make_experiment(name, experiment_id, lifecycle_stage="active"):
     e = MagicMock()
     e.name = name
@@ -51,18 +60,88 @@ def _make_run(experiment_id, prompt_name=None):
 
 class TestListExperimentsNoFilter:
 
-    def test_returns_all_active_experiments(self, client):
+    def test_returns_capped_active_experiments(self, client):
         exps = [_make_experiment("exp1", "1"), _make_experiment("exp2", "2")]
         mock_client = MagicMock()
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments")
 
         assert resp.status_code == 200
         names = [e["name"] for e in resp.json()["experiments"]]
         assert "exp1" in names and "exp2" in names
+        mock_client.search_experiments.assert_called_once()
+        assert mock_client.search_experiments.call_args.kwargs.get("max_results") == 50
+
+    def test_returns_configured_experiment_only(self, client):
+        configured = _make_experiment("/Shared/my-exp", "cfg-1")
+        mock_client = MagicMock()
+        mock_client.get_experiment_by_name.return_value = configured
+
+        with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value="/Shared/my-exp"), \
+             patch("server.routes.evaluate.make_experiment_url", return_value="https://example.com/exp"):
+            resp = client.get("/api/eval/experiments")
+
+        assert resp.status_code == 200
+        data = resp.json()["experiments"]
+        assert len(data) == 1
+        assert data[0]["name"] == "/Shared/my-exp"
+        mock_client.search_experiments.assert_not_called()
+
+    def test_configured_only_skips_workspace_scan(self, client):
+        configured = _make_experiment("/Shared/my-exp", "cfg-1")
+        mock_client = MagicMock()
+        mock_client.get_experiment_by_name.return_value = configured
+
+        with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value="/Shared/my-exp"), \
+             patch("server.routes.evaluate.make_experiment_url", return_value="https://example.com/exp"):
+            resp = client.get("/api/eval/experiments?configured_only=true")
+
+        assert resp.status_code == 200
+        assert resp.json()["experiments"][0]["name"] == "/Shared/my-exp"
+        mock_client.search_experiments.assert_not_called()
+
+    def test_browse_skips_configured_only_fast_path(self, client):
+        configured = _make_experiment("/Shared/my-exp", "cfg-1")
+        browsed = [
+            _make_experiment("/Shared/my-exp", "cfg-1"),
+            _make_experiment("/Shared/other-exp", "2"),
+        ]
+        mock_client = MagicMock()
+        mock_client.get_experiment_by_name.return_value = configured
+        mock_client.search_experiments.return_value = browsed
+
+        with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value="/Shared/my-exp"), \
+             patch("server.routes.evaluate.make_experiment_url", return_value=None):
+            resp = client.get("/api/eval/experiments?browse=true")
+
+        assert resp.status_code == 200
+        names = [e["name"] for e in resp.json()["experiments"]]
+        assert "/Shared/other-exp" in names
+        mock_client.search_experiments.assert_called_once()
+
+    def test_search_filters_browsed_experiments(self, client):
+        exps = [
+            _make_experiment("/Shared/hinge-prompt-playground", "1"),
+            _make_experiment("/Shared/other-exp", "2"),
+        ]
+        mock_client = MagicMock()
+        mock_client.search_experiments.return_value = exps
+
+        with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
+             patch("server.routes.evaluate.make_experiment_url", return_value=None):
+            resp = client.get("/api/eval/experiments?q=hinge")
+
+        assert resp.status_code == 200
+        names = [e["name"] for e in resp.json()["experiments"]]
+        assert names == ["/Shared/hinge-prompt-playground"]
 
     def test_filters_out_deleted_experiments(self, client):
         exps = [
@@ -73,6 +152,7 @@ class TestListExperimentsNoFilter:
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments")
 
@@ -86,6 +166,7 @@ class TestListExperimentsNoFilter:
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value="https://example.com/exp"):
             resp = client.get("/api/eval/experiments")
 
@@ -98,6 +179,7 @@ class TestListExperimentsNoFilter:
         mock_client.search_experiments.return_value = []
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments")
 
@@ -124,9 +206,10 @@ class TestListExperimentsWithFilter:
         """Build a mock mlflow client where search_runs returns runs matching the chunk."""
         mock_client = MagicMock()
         mock_client.search_experiments.return_value = experiments
+        mock_client.get_experiment_by_name.return_value = None
 
-        # Return runs from the provided list on each call
         call_count = [0]
+
         def search_runs_side_effect(chunk, filter_string, max_results):
             idx = call_count[0]
             call_count[0] += 1
@@ -144,6 +227,7 @@ class TestListExperimentsWithFilter:
         mock_client = self._setup_client_with_runs(exps, [runs])
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments?catalog=main&schema=prompts")
 
@@ -151,21 +235,23 @@ class TestListExperimentsWithFilter:
         assert "exp_matches" in names
         assert "exp_no_match" not in names
 
-    def test_falls_back_to_all_when_no_matches(self, client):
-        """When no experiments match, return all experiments instead of empty list."""
+    def test_falls_back_to_candidates_when_no_matches(self, client):
+        """When no experiments match the filter, return the capped candidate list."""
         exps = [
             _make_experiment("exp_a", "1"),
             _make_experiment("exp_b", "2"),
         ]
-        # No runs match the catalog.schema prefix
         mock_client = self._setup_client_with_runs(exps, [[]])
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments?catalog=main&schema=prompts")
 
         names = [e["name"] for e in resp.json()["experiments"]]
         assert "exp_a" in names and "exp_b" in names
+        mock_client.search_experiments.assert_called_once()
+        assert mock_client.search_experiments.call_args.kwargs.get("max_results") == 100
 
     def test_invalid_catalog_returns_all(self, client):
         """Catalog name with special chars (not matching \\w-) bypasses filter and returns all."""
@@ -174,35 +260,36 @@ class TestListExperimentsWithFilter:
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments?catalog=bad.cat!&schema=prompts")
 
-        # Should return all (sanitization triggered)
         assert resp.status_code == 200
         assert len(resp.json()["experiments"]) == 2
-        # search_runs should NOT be called (skipped filtering)
         mock_client.search_runs.assert_not_called()
 
-    def test_invalid_schema_returns_all(self, client):
-        """Schema name with dots returns all experiments without filtering."""
+    def test_invalid_schema_returns_browse_list(self, client):
+        """Schema name with dots returns capped browse list without filtering."""
         exps = [_make_experiment("exp1", "1")]
         mock_client = MagicMock()
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments?catalog=main&schema=bad.schema")
 
         assert resp.status_code == 200
         mock_client.search_runs.assert_not_called()
 
-    def test_empty_catalog_returns_all_without_filtering(self, client):
+    def test_empty_catalog_returns_browse_without_filtering(self, client):
         """Empty catalog string skips filtering entirely."""
         exps = [_make_experiment("exp1", "1")]
         mock_client = MagicMock()
         mock_client.search_experiments.return_value = exps
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             resp = client.get("/api/eval/experiments?catalog=&schema=prompts")
 
@@ -217,6 +304,7 @@ class TestListExperimentsWithFilter:
         mock_client.search_runs.return_value = []
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.evaluate.configured_mlflow_experiment_name", return_value=""), \
              patch("server.routes.evaluate.make_experiment_url", return_value=None):
             client.get("/api/eval/experiments?catalog=my_catalog&schema=my_schema")
 

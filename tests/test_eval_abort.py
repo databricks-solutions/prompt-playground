@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from server.routes.evaluate import router
 from server.llm import TokenLimitError, RateLimitError
+from conftest import run_eval_job
 
 
 # ---------------------------------------------------------------------------
@@ -74,28 +75,28 @@ def _base_patches(model_side_effect=None, rows=None):
 class TestTokenLimitFastFail:
 
     def test_token_limit_returns_422(self, client):
-        """TokenLimitError from call_model → 422, not 200 or 500."""
+        """TokenLimitError from call_model → failed job with token-limit message."""
         patches = _base_patches(model_side_effect=TokenLimitError("context exceeded"))
         with ExitStack() as stack:
-            mocks = [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        assert resp.status_code == 422
+            [stack.enter_context(p) for p in patches]
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        assert job["status"] == "failed"
 
     def test_token_limit_message_in_response(self, client):
         patches = _base_patches(model_side_effect=TokenLimitError("context window exceeded"))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        detail = resp.json()["detail"]
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        detail = job.get("error") or ""
         assert "context window" in detail.lower()
 
     def test_token_limit_message_includes_eval_hint(self, client):
-        """The 422 message for eval runs should mention Max Rows."""
+        """The error message for eval runs should mention Max Rows."""
         patches = _base_patches(model_side_effect=TokenLimitError("context exceeded"))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        detail = resp.json()["detail"]
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        detail = job.get("error") or ""
         assert "max rows" in detail.lower() or "reducing" in detail.lower()
 
     def test_token_limit_does_not_call_mlflow_evaluate(self, client):
@@ -105,7 +106,7 @@ class TestTokenLimitFastFail:
         patches.append(patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            client.post("/api/eval/run", json=_BASE_PAYLOAD)
+            run_eval_job(client, _BASE_PAYLOAD)
         mock_evaluate.assert_not_called()
 
 
@@ -116,19 +117,19 @@ class TestTokenLimitFastFail:
 class TestRateLimitFastFail:
 
     def test_rate_limit_returns_422(self, client):
-        """RateLimitError from call_model → 422."""
+        """RateLimitError from call_model → failed job."""
         patches = _base_patches(model_side_effect=RateLimitError("rate limit exceeded"))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        assert resp.status_code == 422
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        assert job["status"] == "failed"
 
     def test_rate_limit_message_in_response(self, client):
         patches = _base_patches(model_side_effect=RateLimitError("rate limit exceeded for this model"))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        detail = resp.json()["detail"]
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        detail = job.get("error") or ""
         assert "rate limit" in detail.lower()
 
     def test_rate_limit_does_not_call_mlflow_evaluate(self, client):
@@ -137,7 +138,7 @@ class TestRateLimitFastFail:
         patches.append(patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            client.post("/api/eval/run", json=_BASE_PAYLOAD)
+            run_eval_job(client, _BASE_PAYLOAD)
         mock_evaluate.assert_not_called()
 
 
@@ -164,15 +165,15 @@ class TestAllErrorResponses:
         """Generic per-row errors are swallowed; eval still returns results to the user."""
         with ExitStack() as stack:
             [stack.enter_context(p) for p in self._all_error_patches()]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        assert resp.status_code == 200
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        assert job["status"] == "completed"
 
     def test_all_errors_run_id_is_none(self, client):
         """When all rows error, no MLflow run should be logged → run_id is None."""
         with ExitStack() as stack:
             [stack.enter_context(p) for p in self._all_error_patches()]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        assert resp.json()["run_id"] is None
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        assert job["result"]["run_id"] is None
 
     def test_all_errors_skips_mlflow_evaluate(self, client):
         mock_evaluate = MagicMock()
@@ -180,15 +181,15 @@ class TestAllErrorResponses:
         patches.append(patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            client.post("/api/eval/run", json=_BASE_PAYLOAD)
+            run_eval_job(client, _BASE_PAYLOAD)
         mock_evaluate.assert_not_called()
 
     def test_all_errors_responses_contain_error_text(self, client):
         """Each row's response should show the [ERROR: ...] text."""
         with ExitStack() as stack:
             [stack.enter_context(p) for p in self._all_error_patches()]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        for row in resp.json()["results"]:
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        for row in job["result"]["results"]:
             assert row["response"].startswith("[ERROR:")
 
 
@@ -223,8 +224,8 @@ class TestPartialErrors:
         ]
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json={**_BASE_PAYLOAD, "max_rows": 2})
-        assert resp.status_code == 200
+            job = run_eval_job(client, {**_BASE_PAYLOAD, "max_rows": 2})
+        assert job["status"] == "completed"
         mock_evaluate.assert_called_once()
 
 
@@ -240,9 +241,9 @@ class TestSuccessfulEval:
         patches.append(patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json={**_BASE_PAYLOAD, "max_rows": 1})
-        assert resp.status_code == 200
-        assert resp.json()["run_id"] == "run-abc"
+            job = run_eval_job(client, {**_BASE_PAYLOAD, "max_rows": 1})
+        assert job["status"] == "completed"
+        assert job["result"]["run_id"] == "run-abc"
 
     def test_successful_eval_returns_avg_score(self, client):
         mock_evaluate = MagicMock(return_value=("run-abc", {
@@ -252,6 +253,6 @@ class TestSuccessfulEval:
         patches.append(patch("server.routes.evaluate.mlflow_genai_evaluate", mock_evaluate))
         with ExitStack() as stack:
             [stack.enter_context(p) for p in patches]
-            resp = client.post("/api/eval/run", json=_BASE_PAYLOAD)
-        assert resp.status_code == 200
-        assert resp.json()["avg_score"] == pytest.approx(4.0, abs=0.01)
+            job = run_eval_job(client, _BASE_PAYLOAD)
+        assert job["status"] == "completed"
+        assert job["result"]["avg_score"] == pytest.approx(4.0, abs=0.01)

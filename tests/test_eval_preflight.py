@@ -22,6 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from server.routes.evaluate import router
+from conftest import run_eval_job
 
 
 # ---------------------------------------------------------------------------
@@ -83,18 +84,19 @@ class TestEvalColumnPreflight:
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "topic_col"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 400
+        assert job["status"] == "failed"
+        assert "not found in dataset" in (job.get("error") or "").lower()
 
     def test_error_message_names_missing_column(self, client):
         rows = [{"other_col": "val"}]
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "topic_col"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        detail = resp.json()["detail"]
+        detail = job.get("error") or ""
         assert "topic_col" in detail
 
     def test_error_message_lists_available_columns(self, client):
@@ -102,9 +104,9 @@ class TestEvalColumnPreflight:
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "nonexistent_col"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        detail = resp.json()["detail"]
+        detail = job.get("error") or ""
         assert "actual_col" in detail or "another_col" in detail
 
     def test_multiple_missing_columns_all_reported(self, client):
@@ -112,11 +114,10 @@ class TestEvalColumnPreflight:
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "col_a", "name": "col_b"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 400
-        detail = resp.json()["detail"]
-        # Both missing columns should be mentioned
+        assert job["status"] == "failed"
+        detail = job.get("error") or ""
         assert "col_a" in detail and "col_b" in detail
 
     def test_missing_column_blocks_call_model(self, client):
@@ -133,9 +134,9 @@ class TestEvalColumnPreflight:
             patch("server.routes.evaluate.configure_mlflow"),
             patch("server.routes.evaluate.get_experiment_id", return_value=None),
         ):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 400
+        assert job["status"] == "failed"
         mock_call.assert_not_called()
 
     def test_all_columns_present_passes_preflight(self, client):
@@ -144,10 +145,10 @@ class TestEvalColumnPreflight:
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "topic_col"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        # Pre-flight passed — may succeed or fail later for other reasons, but not 400 column error
-        assert resp.status_code != 400 or "not found in dataset" not in resp.json().get("detail", "")
+        assert job["status"] == "completed"
+        assert job.get("result") is not None
 
     def test_column_name_with_different_case_is_flagged(self, client):
         """Column names are case-sensitive — 'Topic_Col' != 'topic_col'."""
@@ -155,12 +156,12 @@ class TestEvalColumnPreflight:
         payload = {**_BASE_EVAL_PAYLOAD, "column_mapping": {"topic": "topic_col"}}
 
         with _eval_patches(rows):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 400
+        assert job["status"] == "failed"
 
     def test_empty_dataset_still_returns_400(self, client):
-        """Empty dataset → 'Dataset is empty' 400 (different error, same status)."""
+        """Empty dataset → 'Dataset is empty' error on the background job."""
         payload = {**_BASE_EVAL_PAYLOAD}
 
         with (
@@ -170,10 +171,10 @@ class TestEvalColumnPreflight:
             patch("server.routes.evaluate.configure_mlflow"),
             patch("server.routes.evaluate.get_experiment_id", return_value=None),
         ):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 400
-        assert "empty" in resp.json()["detail"].lower()
+        assert job["status"] == "failed"
+        assert "empty" in (job.get("error") or "").lower()
 
 
 # ---------------------------------------------------------------------------
@@ -198,7 +199,26 @@ class TestTablePreviewEndpoint:
         data = resp.json()
         assert data["columns"] == cols
         assert data["rows"] == rows
-        assert data["total_rows"] == 2
+        assert data["total_rows"] is None
+
+    def test_include_count_runs_count_query(self, client):
+        cols = ["col_a"]
+        rows = [{"col_a": "v1"}]
+        mock_count = MagicMock(return_value=99)
+
+        with (
+            patch("server.routes.evaluate._get_warehouse_id", return_value="wh-id"),
+            patch("server.routes.evaluate.get_table_columns", return_value=cols),
+            patch("server.routes.evaluate.read_table_rows", return_value=rows),
+            patch("server.routes.evaluate.count_table_rows", mock_count),
+        ):
+            resp = client.get(
+                "/api/eval/table-preview?catalog=main&schema=eval&table=t&include_count=true"
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["total_rows"] == 99
+        mock_count.assert_called_once_with("main", "eval", "t", "wh-id")
 
     def test_default_limit_is_20(self, client):
         mock_rows = MagicMock(return_value=[])
@@ -207,7 +227,6 @@ class TestTablePreviewEndpoint:
             patch("server.routes.evaluate._get_warehouse_id", return_value="wh-id"),
             patch("server.routes.evaluate.get_table_columns", return_value=[]),
             patch("server.routes.evaluate.read_table_rows", mock_rows),
-            patch("server.routes.evaluate.count_table_rows", return_value=0),
         ):
             client.get("/api/eval/table-preview?catalog=main&schema=eval&table=t")
 
@@ -220,7 +239,6 @@ class TestTablePreviewEndpoint:
             patch("server.routes.evaluate._get_warehouse_id", return_value="wh-id"),
             patch("server.routes.evaluate.get_table_columns", return_value=[]),
             patch("server.routes.evaluate.read_table_rows", mock_rows),
-            patch("server.routes.evaluate.count_table_rows", return_value=0),
         ):
             client.get("/api/eval/table-preview?catalog=main&schema=eval&table=t&limit=5")
 
@@ -247,14 +265,13 @@ class TestTablePreviewEndpoint:
             patch("server.routes.evaluate._get_warehouse_id", return_value="wh-id"),
             patch("server.routes.evaluate.get_table_columns", return_value=["col"]),
             patch("server.routes.evaluate.read_table_rows", return_value=[]),
-            patch("server.routes.evaluate.count_table_rows", return_value=0),
         ):
             resp = client.get("/api/eval/table-preview?catalog=main&schema=eval&table=t")
 
         assert resp.status_code == 200
         assert resp.json()["rows"] == []
         assert resp.json()["columns"] == ["col"]
-        assert resp.json()["total_rows"] == 0
+        assert resp.json()["total_rows"] is None
 
     def test_column_order_preserved(self, client):
         """Column order from DESCRIBE TABLE must be maintained for the preview table."""
@@ -264,7 +281,6 @@ class TestTablePreviewEndpoint:
             patch("server.routes.evaluate._get_warehouse_id", return_value="wh-id"),
             patch("server.routes.evaluate.get_table_columns", return_value=cols),
             patch("server.routes.evaluate.read_table_rows", return_value=[]),
-            patch("server.routes.evaluate.count_table_rows", return_value=0),
         ):
             resp = client.get("/api/eval/table-preview?catalog=main&schema=eval&table=t")
 
@@ -297,10 +313,10 @@ class TestEvalRunResponse:
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_NO_SYSTEM),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 200
-        result = resp.json()["results"][0]
+        assert job["status"] == "completed"
+        result = job["result"]["results"][0]
         assert result["rendered_system_prompt"] is None
 
     def test_rendered_system_prompt_populated_when_system_prompt_present(self, client):
@@ -311,10 +327,10 @@ class TestEvalRunResponse:
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 200
-        result = resp.json()["results"][0]
+        assert job["status"] == "completed"
+        result = job["result"]["results"][0]
         assert result["rendered_system_prompt"] is not None
 
     def test_rendered_system_prompt_variables_substituted(self, client):
@@ -325,9 +341,9 @@ class TestEvalRunResponse:
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        result = resp.json()["results"][0]
+        result = job["result"]["results"][0]
         assert result["rendered_system_prompt"] == "You are an expert on Python."
 
     def test_rendered_prompt_still_populated(self, client):
@@ -338,9 +354,9 @@ class TestEvalRunResponse:
         with _eval_patches(rows, extra_patches=[
             patch("server.routes.evaluate.get_prompt_template", return_value=_PROMPT_WITH_SYSTEM),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        result = resp.json()["results"][0]
+        result = job["result"]["results"][0]
         assert result["rendered_prompt"] == "Spark"
 
     def test_multiple_rows_each_get_correct_system_prompt(self, client):
@@ -357,10 +373,10 @@ class TestEvalRunResponse:
             patch("server.routes.evaluate.mlflow_genai_evaluate",
                   return_value=("run-id", {0: (None, None, None), 1: (None, None, None)})),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.status_code == 200
-        results_by_index = {r["row_index"]: r for r in resp.json()["results"]}
+        assert job["status"] == "completed"
+        results_by_index = {r["row_index"]: r for r in job["result"]["results"]}
         assert results_by_index[0]["rendered_system_prompt"] == "You are an expert on Python."
         assert results_by_index[1]["rendered_system_prompt"] == "You are an expert on Scala."
 
@@ -374,6 +390,6 @@ class TestEvalRunResponse:
             patch("server.routes.evaluate.get_prompt_template",
                   return_value={"template": "{{topic}}", "variables": ["topic"]}),
         ]):
-            resp = client.post("/api/eval/run", json=payload)
+            job = run_eval_job(client, payload)
 
-        assert resp.json()["results"][0]["rendered_system_prompt"] is None
+        assert job["result"]["results"][0]["rendered_system_prompt"] is None

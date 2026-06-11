@@ -35,10 +35,7 @@ def _paginate(client, method_name: str, kwargs: dict, token_attr: str = "token")
 
 
 def list_prompts(catalog: str, schema: str) -> list[dict]:
-    """List all registered prompts in a given UC catalog.schema.
-
-    Unity Catalog prompt registries require catalog and schema to be specified.
-    """
+    """List all registered prompts in a given UC catalog.schema."""
     client = get_mlflow_client()
     filter_string = f"catalog = '{catalog}' AND schema = '{schema}'"
     prompts = []

@@ -1,6 +1,6 @@
 """Tests for prompt template variable rendering."""
 
-from server.mlflow_client import render_template
+from server.templates import render_template
 
 
 def test_basic_substitution():

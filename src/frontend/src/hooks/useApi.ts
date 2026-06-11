@@ -7,10 +7,43 @@
 
 import { useState, useEffect, useCallback } from 'react';
 import type { AppConfig } from '../types';
+import { isAppConfigured } from '../utils/configUtils';
+import { cachedFetch, invalidateCache } from '../utils/fetchCache';
 
 const API_BASE = '/api';
 
 export type ApiFetchOptions = RequestInit & { timeoutMs?: number };
+
+function formatApiErrorDetail(detail: unknown, status: number): string {
+  if (typeof detail === 'string') {
+    if (
+      detail.includes('Credential was not sent') ||
+      detail.includes('401:') ||
+      detail.includes('cannot get access token') ||
+      detail.includes('token refresh') ||
+      detail.includes('exit status 45')
+    ) {
+      return 'Databricks authentication expired. For local dev, run: databricks auth login --profile e2-demo-field-eng then restart the API server with DATABRICKS_PROFILE=e2-demo-field-eng.';
+    }
+    if (detail.length > 280) {
+      return `${detail.slice(0, 280)}…`;
+    }
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    return detail
+      .map((item) =>
+        typeof item === 'object' && item && 'msg' in item
+          ? String((item as { msg: string }).msg)
+          : String(item),
+      )
+      .join('; ');
+  }
+  if (detail && typeof detail === 'object') {
+    return JSON.stringify(detail);
+  }
+  return `API error: ${status}`;
+}
 
 export async function apiFetch<T>(path: string, options?: ApiFetchOptions): Promise<T> {
   const { timeoutMs, ...init } = options ?? {};
@@ -33,7 +66,7 @@ export async function apiFetch<T>(path: string, options?: ApiFetchOptions): Prom
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(body.detail || `API error: ${res.status}`);
+      throw new Error(formatApiErrorDetail(body.detail ?? res.statusText, res.status));
     }
     return res.json();
   } catch (e) {
@@ -82,10 +115,20 @@ export function useConfig() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const refresh = useCallback(async () => {
+  const applyConfig = useCallback((cfg: AppConfig) => {
+    invalidateCache('config');
+    setConfig(cfg);
+  }, []);
+
+  const refresh = useCallback(async (opts?: { force?: boolean }) => {
+    if (opts?.force) invalidateCache('config');
     setLoading(true);
     try {
-      const data = await apiFetch<AppConfig>('/config', { timeoutMs: 15_000 });
+      const data = await cachedFetch(
+        'config',
+        () => apiFetch<AppConfig>('/config', { timeoutMs: 15_000 }),
+        0,
+      );
       setConfig(data);
     } catch {
       setConfig({
@@ -97,6 +140,7 @@ export function useConfig() {
         sql_warehouse_id: '',
         sql_warehouse_name: '',
         evaluate_tab_enabled: false,
+        is_configured: false,
       });
     } finally {
       setLoading(false);
@@ -106,17 +150,19 @@ export function useConfig() {
   useEffect(() => { refresh(); }, [refresh]);
 
   const saveSettings = useCallback(async (updates: Partial<AppConfig>) => {
+    invalidateCache('config');
     const saved = await apiFetch<AppConfig>('/config', {
       method: 'POST',
       body: JSON.stringify(updates),
     });
+    invalidateCache('config');
     setConfig(saved);
     return saved;
   }, []);
 
-  const isConfigured = !loading && !!config?.prompt_catalog;
+  const isConfigured = !loading && isAppConfigured(config);
 
-  return { config, loading, refresh, saveSettings, isConfigured };
+  return { config, loading, refresh, applyConfig, saveSettings, isConfigured };
 }
 
 // --- Re-exports for backward compatibility ---
@@ -124,4 +170,14 @@ export function useConfig() {
 export { usePrompts, usePromptVersions, usePromptTemplate, useCreatePrompt, useSaveVersion } from './usePromptApi';
 export { useModels } from './useModelApi';
 export { useRunPrompt } from './useRunApi';
-export { useExperiments, useExperimentPrompts, useJudges, useCreateJudge, useDeleteJudge, useEvalTables, useEvalColumns, useRunEval } from './useEvalApi';
+export {
+  useExperiments,
+  useExperimentBrowse,
+  useExperimentPrompts,
+  useJudges,
+  useCreateJudge,
+  useDeleteJudge,
+  useEvalTables,
+  useEvalColumns,
+  useRunEval,
+} from './useEvalApi';

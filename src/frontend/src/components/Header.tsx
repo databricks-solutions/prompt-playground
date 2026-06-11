@@ -1,13 +1,21 @@
 import { PenLine, Settings } from 'lucide-react';
 import SearchableSelect from './SearchableSelect';
 
+interface ExperimentOption {
+  value: string;
+  label: string;
+  description?: string;
+}
+
 interface Props {
   experimentName: string;
-  experiments: { name: string }[];
+  experimentOptions: ExperimentOption[];
   experimentsLoading: boolean;
   /** MLflow experiment list failed (timeout, auth, etc.) */
   experimentsError: string | null;
   onRetryExperiments?: () => void;
+  onExperimentOpen?: () => void;
+  onExperimentQueryChange?: (query: string) => void;
   /** When false, prompt registry / workspace is not configured — do not call MLflow for experiments. */
   workspaceConfigured: boolean;
   /** While Settings is open, hide experiment fetch errors so MLflow issues don’t interrupt setup. */
@@ -23,10 +31,12 @@ interface Props {
 
 export default function Header({
   experimentName,
-  experiments,
+  experimentOptions,
   experimentsLoading,
   experimentsError,
   onRetryExperiments,
+  onExperimentOpen,
+  onExperimentQueryChange,
   workspaceConfigured,
   settingsOpen = false,
   onExperimentChange,
@@ -76,7 +86,12 @@ export default function Header({
                               : 'Select an experiment…'
                     }
                     allowClear={false}
-                    options={experiments.map((e) => ({ value: e.name, label: e.name }))}
+                    onOpen={onExperimentOpen}
+                    onQueryChange={onExperimentQueryChange}
+                    loadingLabel="Loading experiments…"
+                    emptyHint="Type part of the name (e.g. hinge) to search experiments"
+                    minSearchChars={2}
+                    options={experimentOptions}
                   />
                 </div>
               </div>

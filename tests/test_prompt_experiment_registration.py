@@ -34,11 +34,8 @@ def _mock_create_prompt(**kwargs):
 
 class TestExperimentRegistrationOnCreate:
 
-    def test_create_with_experiment_name_tags_prompt(self, client, monkeypatch):
+    def test_create_with_experiment_name_tags_prompt(self, client):
         """When experiment_name is provided, the prompt gets tagged with the experiment ID."""
-        monkeypatch.setenv("DATABRICKS_HOST", "https://test.databricks.com")
-        monkeypatch.setenv("DATABRICKS_TOKEN", "test-token")
-
         mock_experiment = MagicMock()
         mock_experiment.experiment_id = "exp-42"
         mock_client = MagicMock()
@@ -54,6 +51,8 @@ class TestExperimentRegistrationOnCreate:
         with patch("server.routes.prompts.create_prompt", side_effect=_mock_create_prompt), \
              patch("server.routes.prompts.configure_mlflow"), \
              patch("server.routes.prompts.get_mlflow_client", return_value=mock_client), \
+             patch("server.routes.prompts.get_workspace_host", return_value="https://test.databricks.com"), \
+             patch("server.routes.prompts.get_oauth_token", return_value="test-token"), \
              patch("httpx.AsyncClient", return_value=mock_http):
             resp = client.post("/api/prompts", json={
                 "name": "cat.sch.test",

@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
 import Header from './components/Header';
 import TabBar from './components/TabBar';
 import type { Tab } from './components/TabBar';
@@ -16,6 +16,7 @@ import PromptForm from './components/PromptForm';
 import SettingsModal from './components/SettingsModal';
 import SearchableSelect from './components/SearchableSelect';
 import {
+  apiFetch,
   useConfig,
   usePrompts,
   usePromptVersions,
@@ -28,6 +29,12 @@ import {
   useCreatePrompt,
 } from './hooks/useApi';
 import { usePromptEditor } from './hooks/usePromptEditor';
+import {
+  experimentSelectOptions,
+  pickSuggestedExperiment,
+  readStoredExperimentName,
+  writeStoredExperimentName,
+} from './utils/experimentUtils';
 
 const PP_SETUP_BANNER_DISMISSED_KEY = 'pp-setup-banner-dismissed';
 
@@ -49,21 +56,21 @@ export default function App() {
   });
 
   // Load catalog/schema config from backend (set via app.yaml env vars)
-  const { config, loading: configLoading, refresh: refreshConfig, isConfigured } = useConfig();
+  const { config, loading: configLoading, refresh: refreshConfig, applyConfig, isConfigured } = useConfig();
 
   // Catalog / schema state — initialized from config once loaded
   const [catalog, setCatalog] = useState('');
   const [schema, setSchema] = useState('');
 
-  // Experiment name state
-  const [experimentName, setExperimentName] = useState('');
+  // Experiment name state — session-persisted; no manual path typing required
+  const [experimentName, setExperimentName] = useState(readStoredExperimentName);
   const [filterByExperiment, setFilterByExperiment] = useState(true);
 
   /** Prompt catalog set — UC prompts, experiment ↔ prompt filtering, header “connected”. */
   const workspaceReady = !configLoading && isConfigured;
 
-  /** Fetch MLflow experiment list as soon as `/api/config` returns — parallel with Settings; no prompt catalog required. */
-  const experimentsPrefetchEnabled = !configLoading;
+  /** Fetch MLflow experiments only after prompt registry is configured in Settings. */
+  const experimentsPrefetchEnabled = workspaceReady;
 
   // Sync catalog/schema/experiment from config once it loads
   useEffect(() => {
@@ -71,9 +78,9 @@ export default function App() {
       setCatalog(config.prompt_catalog);
       setSchema(config.prompt_schema);
     }
-    // Only apply default MLflow experiment after workspace is configured (avoid UC/MLflow calls before Settings)
-    if (config && isConfigured && !experimentName) {
-      setExperimentName(config.mlflow_experiment_name);
+    // Deploy default from Settings only when nothing selected this session
+    if (config && isConfigured && !experimentName && config.mlflow_experiment_name?.trim()) {
+      setExperimentName(config.mlflow_experiment_name.trim());
     }
   }, [config, isConfigured, catalog, experimentName]);
 
@@ -124,7 +131,48 @@ export default function App() {
     loading: experimentsLoading,
     error: experimentsError,
     refresh: refreshExperiments,
-  } = useExperiments(experimentsPrefetchEnabled);
+    onExperimentOpen,
+    onExperimentQueryChange,
+  } = useExperiments(experimentsPrefetchEnabled, activeCatalog, activeSchema);
+
+  const headerExperiments = useMemo(() => {
+    const byName = new Map(experiments.map((e) => [e.name, e]));
+    for (const seed of [experimentName, config?.mlflow_experiment_name]) {
+      const name = seed?.trim();
+      if (name && !byName.has(name)) {
+        byName.set(name, { name, experiment_id: '', url: '' });
+      }
+    }
+    return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [experiments, experimentName, config?.mlflow_experiment_name]);
+
+  const headerExperimentOptions = useMemo(
+    () => experimentSelectOptions(headerExperiments),
+    [headerExperiments],
+  );
+
+  // Auto-pick an experiment linked to this prompt catalog (no path typing)
+  useEffect(() => {
+    if (!workspaceReady || experimentName || !activeCatalog || !activeSchema) return;
+    const params = new URLSearchParams({
+      browse: 'true',
+      catalog: activeCatalog,
+      schema: activeSchema,
+    });
+    apiFetch<{ experiments: Array<{ name: string }> }>(
+      `/eval/experiments?${params.toString()}`,
+      { timeoutMs: 60_000 },
+    )
+      .then((data) => {
+        const pick = pickSuggestedExperiment(data.experiments, activeCatalog);
+        if (pick) {
+          setExperimentName(pick.name);
+          writeStoredExperimentName(pick.name);
+        }
+      })
+      .catch(() => {});
+  }, [workspaceReady, experimentName, activeCatalog, activeSchema]);
+
   const { promptNames: experimentPromptNames, loading: experimentPromptsLoading, refresh: refreshExperimentPrompts } = useExperimentPrompts(
     experimentName,
     activeCatalog,
@@ -177,6 +225,7 @@ export default function App() {
   const handleExperimentChange = useCallback((name: string) => {
     setExperimentName(name);
     setFilterByExperiment(true);
+    writeStoredExperimentName(name);
   }, []);
 
   // Handle prompt selection - clear variables, versions, and exit edit mode
@@ -265,9 +314,7 @@ export default function App() {
           className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3 bg-amber-50 border-b border-amber-100 text-sm text-amber-950 shrink-0"
         >
           <span className="min-w-0">
-            <strong className="font-semibold">Setup required.</strong>{' '}
-            Choose a Prompt Registry catalog, schema, and SQL warehouse in Settings. Until then, prompts and MLflow
-            experiments stay idle so the UI stays responsive offline.
+            <strong className="font-semibold">Setup required.</strong> Open Settings to configure the app.
           </span>
           <span className="flex items-center gap-2 shrink-0">
             <button
@@ -297,10 +344,12 @@ export default function App() {
 
       <Header
         experimentName={experimentName}
-        experiments={experiments}
+        experimentOptions={headerExperimentOptions}
         experimentsLoading={experimentsLoading}
         experimentsError={experimentsError}
         onRetryExperiments={refreshExperiments}
+        onExperimentOpen={onExperimentOpen}
+        onExperimentQueryChange={onExperimentQueryChange}
         workspaceConfigured={workspaceReady}
         settingsOpen={showSettings}
         onExperimentChange={handleExperimentChange}
@@ -321,10 +370,9 @@ export default function App() {
 
 
       <main className="flex-1 overflow-hidden">
-        {activeTab === 'howto' && <HowToTab />}
+        {activeTab === 'howto' && <HowToTab evaluateTabEnabled={evaluateTabEnabled} />}
 
-        {/* Evaluate tab */}
-        <div className={activeTab !== 'evaluate' ? 'hidden' : 'h-full'}>
+        {evaluateTabEnabled && activeTab === 'evaluate' && (
           <EvaluatePanel
             evalCatalog={config?.eval_catalog ?? activeCatalog}
             evalSchema={config?.eval_schema ?? ''}
@@ -344,7 +392,7 @@ export default function App() {
             onOpenSettings={() => setShowSettings(true)}
             hasWarehouse={!!config?.sql_warehouse_id}
           />
-        </div>
+        )}
 
         {/* Prompts tab — browse, manage, edit */}
         <div className={`h-full flex ${activeTab !== 'prompts' ? 'hidden' : ''}`}>
@@ -377,8 +425,8 @@ export default function App() {
               )}
             </div>
 
-            {/* Warehouse warning — shown when catalog is set but warehouse is missing */}
-            {activeCatalog && !config?.sql_warehouse_id && (
+            {/* Warehouse only required when batch evaluation is enabled */}
+            {evaluateTabEnabled && activeCatalog && !config?.sql_warehouse_id && (
               <div className="flex-shrink-0 px-4 py-2.5 border-b border-amber-100 bg-amber-50">
                 <p className="text-xs text-amber-700">
                   SQL warehouse not configured.{' '}
@@ -634,7 +682,8 @@ export default function App() {
         <SettingsModal
           config={config}
           onSave={(updated) => {
-            refreshConfig();
+            applyConfig(updated);
+            void refreshConfig({ force: true });
             setCatalog(updated.prompt_catalog);
             setSchema(updated.prompt_schema);
             setExperimentName(updated.mlflow_experiment_name);

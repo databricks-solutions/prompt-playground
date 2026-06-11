@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import type { ModelEndpoint } from '../types';
 import { apiFetch } from './useApi';
+import { cachedFetch } from '../utils/fetchCache';
 
 export function useModels() {
   const [models, setModels] = useState<ModelEndpoint[]>([]);
@@ -12,7 +13,9 @@ export function useModels() {
     setLoading(true);
     setError(null);
     try {
-      const data = await apiFetch<{ models: ModelEndpoint[] }>('/models');
+      const data = await cachedFetch('models', () =>
+        apiFetch<{ models: ModelEndpoint[] }>('/models'),
+      );
       setModels(data.models);
       fetchedRef.current = true;
     } catch (e: any) {

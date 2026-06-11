@@ -15,7 +15,7 @@ import json
 import pytest
 
 import server.settings as settings_module
-from server.settings import load_settings, save_settings, get_effective_config
+from server.settings import load_settings, save_settings, get_effective_config, is_app_configured
 
 
 @pytest.fixture(autouse=True)
@@ -175,3 +175,36 @@ def test_persisted_warehouse_name_returned(isolated_settings_file, monkeypatch):
 
     cfg = get_effective_config()
     assert cfg["sql_warehouse_name"] == "My Serverless"
+
+
+# ---------------------------------------------------------------------------
+# is_app_configured
+# ---------------------------------------------------------------------------
+
+def test_is_app_configured_prompts_only(monkeypatch):
+    cfg = {
+        "prompt_catalog": "cat",
+        "prompt_schema": "prompts",
+        "evaluate_tab_enabled": False,
+    }
+    assert is_app_configured(cfg) is True
+
+
+def test_is_app_configured_requires_schema(monkeypatch):
+    cfg = {"prompt_catalog": "cat", "prompt_schema": "", "evaluate_tab_enabled": False}
+    assert is_app_configured(cfg) is False
+
+
+def test_is_app_configured_eval_requires_warehouse_and_eval_schema(monkeypatch):
+    cfg = {
+        "prompt_catalog": "cat",
+        "prompt_schema": "prompts",
+        "evaluate_tab_enabled": True,
+        "eval_catalog": "cat",
+        "eval_schema": "",
+        "sql_warehouse_id": "wh-1",
+    }
+    assert is_app_configured(cfg) is False
+
+    cfg["eval_schema"] = "eval_data"
+    assert is_app_configured(cfg) is True

@@ -3,7 +3,7 @@
 import asyncio
 from fastapi import APIRouter, BackgroundTasks
 from pydantic import BaseModel
-from server.settings import get_effective_config, save_settings
+from server.settings import get_effective_config, is_app_configured, save_settings
 from server.config import get_workspace_client
 
 router = APIRouter(prefix="/api/config")
@@ -42,6 +42,7 @@ async def get_config(background_tasks: BackgroundTasks):
         "sql_warehouse_id": wh_id,
         "sql_warehouse_name": wh_name,
         "evaluate_tab_enabled": bool(cfg.get("evaluate_tab_enabled", False)),
+        "is_configured": is_app_configured(cfg),
     }
 
 

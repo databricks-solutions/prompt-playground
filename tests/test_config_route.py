@@ -41,6 +41,7 @@ def test_config_returns_defaults(client, monkeypatch):
     assert data["eval_schema"] == ""
     assert data["sql_warehouse_id"] == ""
     assert data["evaluate_tab_enabled"] is False
+    assert data["is_configured"] is False
 
 
 def test_config_reads_env_vars(client, monkeypatch):
@@ -77,8 +78,36 @@ def test_config_response_has_required_keys(client, monkeypatch):
     assert set(data.keys()) == {
         "prompt_catalog", "prompt_schema", "eval_catalog", "eval_schema",
         "mlflow_experiment_name", "sql_warehouse_id", "sql_warehouse_name",
-        "evaluate_tab_enabled",
+        "evaluate_tab_enabled", "is_configured",
     }
+
+
+def test_config_is_configured_prompts_only(client, monkeypatch):
+    monkeypatch.setenv("PROMPT_CATALOG", "cat")
+    monkeypatch.setenv("PROMPT_SCHEMA", "prompts")
+    monkeypatch.delenv("EVALUATE_TAB_ENABLED", raising=False)
+
+    response = client.get("/api/config")
+    assert response.json()["is_configured"] is True
+
+
+def test_config_not_configured_without_schema(client, monkeypatch):
+    monkeypatch.setenv("PROMPT_CATALOG", "cat")
+    monkeypatch.delenv("PROMPT_SCHEMA", raising=False)
+
+    response = client.get("/api/config")
+    assert response.json()["is_configured"] is False
+
+
+def test_config_requires_eval_fields_when_evaluate_enabled(client, monkeypatch):
+    monkeypatch.setenv("PROMPT_CATALOG", "cat")
+    monkeypatch.setenv("PROMPT_SCHEMA", "prompts")
+    monkeypatch.setenv("EVALUATE_TAB_ENABLED", "true")
+    monkeypatch.delenv("EVAL_SCHEMA", raising=False)
+    monkeypatch.delenv("SQL_WAREHOUSE_ID", raising=False)
+
+    response = client.get("/api/config")
+    assert response.json()["is_configured"] is False
 
 
 def test_config_warehouse_name_empty_by_default(client, monkeypatch):

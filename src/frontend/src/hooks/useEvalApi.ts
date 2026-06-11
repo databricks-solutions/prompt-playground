@@ -1,39 +1,138 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { ExperimentInfo, JudgeInfo, EvalResponse, EvalHistoryRun, EvalTraceRow } from '../types';
 import { apiFetch, useMutation } from './useApi';
+import { cachedFetch } from '../utils/fetchCache';
 
-export function useExperiments(enabled: boolean) {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+interface EvalJobStatus {
+  job_id: string;
+  status: string;
+  progress?: number;
+  total?: number;
+  message?: string;
+  result?: EvalResponse;
+  error?: string | null;
+}
+
+function mergeExperiments(
+  ...lists: Array<ExperimentInfo[] | undefined>
+): ExperimentInfo[] {
+  const byName = new Map<string, ExperimentInfo>();
+  for (const list of lists) {
+    for (const exp of list ?? []) {
+      if (exp?.name) byName.set(exp.name, exp);
+    }
+  }
+  return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function useExperimentBrowse(
+  enabled: boolean,
+  catalog?: string,
+  schema?: string,
+) {
   const [experiments, setExperiments] = useState<ExperimentInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const searchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const refresh = useCallback(async () => {
+  const browseExperiments = useCallback(
+    async (search?: string) => {
+      if (!enabled) return [];
+      setLoading(true);
+      setError(null);
+      const query = search?.trim() ?? '';
+      const params = new URLSearchParams({ browse: 'true' });
+      const cat = catalog?.trim() ?? '';
+      const sch = schema?.trim() ?? '';
+      if (query.length >= 2) {
+        params.set('q', query);
+      } else if (cat && sch) {
+        params.set('catalog', cat);
+        params.set('schema', sch);
+      }
+      const cacheKey = `experiments:browse:${cat}:${sch}:${query}`;
+      try {
+        const data = await cachedFetch(cacheKey, () =>
+          apiFetch<{ experiments: ExperimentInfo[] }>(
+            `/eval/experiments?${params.toString()}`,
+            { timeoutMs: 90_000 },
+          ),
+        );
+        setExperiments((prev) => mergeExperiments(prev, data.experiments));
+        return data.experiments;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not load MLflow experiments');
+        return [];
+      } finally {
+        setLoading(false);
+      }
+    },
+    [enabled, catalog, schema],
+  );
+
+  const handleOpen = useCallback(() => {
+    apiFetch('/eval/experiments/warm', { method: 'POST' }).catch(() => {});
+    void browseExperiments();
+  }, [browseExperiments]);
+
+  const handleQueryChange = useCallback(
+    (query: string) => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+      const trimmed = query.trim();
+      if (trimmed.length < 2) {
+        void browseExperiments();
+        return;
+      }
+      searchTimer.current = setTimeout(() => {
+        void browseExperiments(trimmed);
+      }, 400);
+    },
+    [browseExperiments],
+  );
+
+  useEffect(() => {
     if (!enabled) {
       setExperiments([]);
       setLoading(false);
       setError(null);
       return;
     }
-    setLoading(true);
     setError(null);
-    try {
-      const data = await apiFetch<{ experiments: ExperimentInfo[] }>('/eval/experiments', {
-        timeoutMs: 25_000,
-      });
-      setExperiments(data.experiments);
-    } catch (e) {
-      setExperiments([]);
-      setError(e instanceof Error ? e.message : 'Could not load MLflow experiments');
-    } finally {
-      setLoading(false);
-    }
+    apiFetch('/eval/experiments/warm', { method: 'POST' }).catch(() => {});
+    return () => {
+      if (searchTimer.current) clearTimeout(searchTimer.current);
+    };
   }, [enabled]);
 
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
+  return {
+    experiments,
+    setExperiments,
+    loading,
+    error,
+    browseExperiments,
+    onOpen: handleOpen,
+    onQueryChange: handleQueryChange,
+  };
+}
 
-  return { experiments, loading, error, refresh };
+export function useExperiments(enabled: boolean, catalog?: string, schema?: string) {
+  const browse = useExperimentBrowse(enabled, catalog, schema);
+
+  useEffect(() => {
+    if (!enabled) return;
+    void browse.browseExperiments();
+  }, [enabled, catalog, schema, browse.browseExperiments]);
+
+  return {
+    experiments: browse.experiments,
+    loading: browse.loading,
+    error: browse.error,
+    refresh: browse.browseExperiments,
+    onExperimentOpen: browse.onOpen,
+    onExperimentQueryChange: browse.onQueryChange,
+  };
 }
 
 export function useExperimentPrompts(
@@ -202,8 +301,8 @@ export function useTablePreview(catalog: string, schema: string, table: string |
     if (!table) { setColumns([]); setRows([]); setTotalRows(null); return; }
     setLoading(true);
     const params = new URLSearchParams({ catalog, schema, table, limit: String(limit) });
-    apiFetch<{ columns: string[]; rows: Record<string, string>[]; total_rows: number }>(`/eval/table-preview?${params.toString()}`)
-      .then((d) => { setColumns(d.columns); setRows(d.rows); setTotalRows(d.total_rows); })
+    apiFetch<{ columns: string[]; rows: Record<string, string>[]; total_rows: number | null }>(`/eval/table-preview?${params.toString()}`)
+      .then((d) => { setColumns(d.columns); setRows(d.rows); setTotalRows(d.total_rows ?? null); })
       .catch(() => { setColumns([]); setRows([]); setTotalRows(null); })
       .finally(() => setLoading(false));
   }, [catalog, schema, table]);
@@ -239,18 +338,32 @@ export function useRunEval() {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch('/api/eval/run', {
+      const start = await apiFetch<{ job_id: string; status: string }>('/eval/run', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
         signal: abortRef.current.signal,
+        timeoutMs: 60_000,
       });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new Error(body.detail || `API error: ${res.status}`);
+      let status = start.status;
+      let jobId = start.job_id;
+      while (status === 'pending' || status === 'running') {
+        if (abortRef.current?.signal.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        await sleep(1500);
+        const poll = await apiFetch<EvalJobStatus>(
+          `/eval/run/status?${new URLSearchParams({ job_id: jobId }).toString()}`,
+          { signal: abortRef.current.signal, timeoutMs: 30_000 },
+        );
+        status = poll.status;
+        if (status === 'failed') {
+          throw new Error(poll.error || 'Evaluation failed');
+        }
+        if (status === 'completed' && poll.result) {
+          setResult(poll.result);
+          return;
+        }
       }
-      const data: EvalResponse = await res.json();
-      setResult(data);
     } catch (e: any) {
       if (e.name !== 'AbortError') setError(e.message);
     } finally {

@@ -7,11 +7,8 @@ command:
   - "8000"
 
 env:
-  - name: SQL_WAREHOUSE_ID
-    valueFrom: sql-warehouse
-  # Filled from bundle variables on deploy (${var.*}); empty for local dev unless env is exported.
-  - name: MLFLOW_EXPERIMENT_NAME
-    value: ${var.mlflow_experiment_name}
+  # SQL warehouse and MLflow experiment are chosen in App Settings (pp_settings.json), not at deploy time.
+  # Bundle variables below seed optional defaults; catalog/schema are typically set via Settings after deploy.
   - name: PROMPT_CATALOG
     value: ${var.prompt_catalog}
   - name: PROMPT_SCHEMA

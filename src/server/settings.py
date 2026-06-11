@@ -66,3 +66,26 @@ def get_effective_config() -> dict:
     merged = {**env_defaults, **persisted}
     merged["evaluate_tab_enabled"] = _coerce_bool(merged.get("evaluate_tab_enabled", False))
     return merged
+
+
+def is_app_configured(cfg: dict | None = None) -> bool:
+    """True when the app has enough settings to load prompts and run the Playground.
+
+    Prompt catalog + schema are always required. When batch evaluation is enabled,
+    SQL warehouse and eval catalog/schema are required as well.
+    """
+    cfg = cfg if cfg is not None else get_effective_config()
+    if not (cfg.get("prompt_catalog") or "").strip():
+        return False
+    if not (cfg.get("prompt_schema") or "").strip():
+        return False
+    if not _coerce_bool(cfg.get("evaluate_tab_enabled", False)):
+        return True
+    if not (cfg.get("sql_warehouse_id") or "").strip():
+        return False
+    eval_catalog = (cfg.get("eval_catalog") or cfg.get("prompt_catalog") or "").strip()
+    if not eval_catalog:
+        return False
+    if not (cfg.get("eval_schema") or "").strip():
+        return False
+    return True

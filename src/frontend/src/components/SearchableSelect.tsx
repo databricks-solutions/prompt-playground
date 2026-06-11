@@ -35,8 +35,16 @@ interface Props {
   allowClear?: boolean;
   /** Called when the dropdown opens — use for lazy-loading options */
   onOpen?: () => void;
+  /** Called when the search query changes while open (e.g. server-side filter) */
+  onQueryChange?: (query: string) => void;
   /** When true, shows a loading spinner inside the open dropdown */
   loading?: boolean;
+  /** Label beside the spinner when loading with existing options */
+  loadingLabel?: string;
+  /** Shown when open with no options and not loading (e.g. type-to-search dropdowns) */
+  emptyHint?: string;
+  /** When set with onQueryChange, show a “type more” hint until the query reaches this length */
+  minSearchChars?: number;
 }
 
 export default function SearchableSelect({
@@ -50,7 +58,11 @@ export default function SearchableSelect({
   leftIcon,
   allowClear = true,
   onOpen,
+  onQueryChange,
   loading = false,
+  loadingLabel = 'Loading…',
+  emptyHint,
+  minSearchChars,
 }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -62,6 +74,18 @@ export default function SearchableSelect({
   const selectedLabel = allOptions.find((o) => o.value === value)?.label ?? value;
 
   const q = query.toLowerCase();
+  const searchMinLen = minSearchChars ?? (onQueryChange ? 2 : 0);
+
+  const emptyListMessage = () => {
+    if (onQueryChange && query.trim().length > 0 && query.trim().length < searchMinLen) {
+      return `Type at least ${searchMinLen} characters to search`;
+    }
+    if (emptyHint && query.trim().length < searchMinLen) {
+      return emptyHint;
+    }
+    return 'No results';
+  };
+
   const filter = (opts: SelectOption[]) =>
     q
       ? opts.filter(
@@ -104,7 +128,7 @@ export default function SearchableSelect({
       const anyResults = groups.some((g) => filter(g.options).length > 0);
       if (!anyResults) {
         return (
-          <div className="px-3 py-2 text-sm text-gray-400 text-center">No results</div>
+          <div className="px-3 py-2 text-sm text-gray-400 text-center">{emptyListMessage()}</div>
         );
       }
       return groups.map((g) => {
@@ -140,7 +164,7 @@ export default function SearchableSelect({
     const filtered = filter(options);
     if (filtered.length === 0) {
       return (
-        <div className="px-3 py-2 text-sm text-gray-400 text-center">No results</div>
+        <div className="px-3 py-2 text-sm text-gray-400 text-center">{emptyListMessage()}</div>
       );
     }
     return filtered.map((o) => (
@@ -187,7 +211,11 @@ export default function SearchableSelect({
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+              const next = e.target.value;
+              setQuery(next);
+              onQueryChange?.(next);
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Escape') {
                 setOpen(false);
@@ -221,12 +249,17 @@ export default function SearchableSelect({
       {open && (
         <div className="absolute z-50 mt-1 w-full bg-white rounded-lg shadow-lg ring-1 ring-gray-200 overflow-hidden">
           <div className="max-h-52 overflow-y-auto">
-            {loading ? (
+            {loading && allOptions.length === 0 ? (
               <div className="flex items-center gap-2 px-3 py-3 text-xs text-gray-400">
-                <LoadingSpinner className="w-3.5 h-3.5 text-gray-400" /> Loading…
+                <LoadingSpinner className="w-3.5 h-3.5 text-gray-400" /> {loadingLabel}
               </div>
             ) : (
               <>
+                {loading && (
+                  <div className="flex items-center gap-2 px-3 py-2 text-xs text-gray-400 border-b border-gray-100 bg-gray-50">
+                    <LoadingSpinner className="w-3.5 h-3.5 text-gray-400" /> {loadingLabel}
+                  </div>
+                )}
                 {allowClear && (
                   <button
                     type="button"

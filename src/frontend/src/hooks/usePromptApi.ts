@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { PromptInfo, PromptVersion, PromptTemplate, CreatePromptResponse, SaveVersionResponse } from '../types';
 import { apiFetch, useMutation } from './useApi';
+import { cachedFetch, invalidateCache } from '../utils/fetchCache';
 
 export function usePrompts(catalog: string, schema: string) {
   const [prompts, setPrompts] = useState<PromptInfo[]>([]);
@@ -13,8 +14,9 @@ export function usePrompts(catalog: string, schema: string) {
     setError(null);
     try {
       const params = new URLSearchParams({ catalog, schema });
-      const data = await apiFetch<{ prompts: PromptInfo[] }>(
-        `/prompts?${params.toString()}`
+      const cacheKey = `prompts:${catalog}.${schema}`;
+      const data = await cachedFetch(cacheKey, () =>
+        apiFetch<{ prompts: PromptInfo[] }>(`/prompts?${params.toString()}`),
       );
       setPrompts(data.prompts);
     } catch (e: any) {
@@ -28,7 +30,14 @@ export function usePrompts(catalog: string, schema: string) {
     refresh();
   }, [refresh]);
 
-  return { prompts, loading, error, refresh };
+  const refreshInvalidating = useCallback(async () => {
+    if (catalog && schema) {
+      invalidateCache(`prompts:${catalog}.${schema}`);
+    }
+    await refresh();
+  }, [catalog, schema, refresh]);
+
+  return { prompts, loading, error, refresh: refreshInvalidating };
 }
 
 export function usePromptVersions(name: string | null) {

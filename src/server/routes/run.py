@@ -1,5 +1,6 @@
 """API routes for running prompts against models."""
 
+import asyncio
 import re
 import json
 import logging
@@ -55,8 +56,8 @@ class RunResponse(BaseModel):
     experiment_url: str | None = None
 
 
-def _load_prompt_data(request: RunRequest) -> dict:
-    """Load prompt template from registry or use draft."""
+def _load_prompt_data_sync(request: RunRequest) -> dict:
+    """Load prompt template from registry or use draft (sync — run via to_thread)."""
     if request.draft_template is not None:
         system_prompt, user_template = parse_system_user(request.draft_template)
         return {
@@ -64,8 +65,12 @@ def _load_prompt_data(request: RunRequest) -> dict:
             "system_prompt": system_prompt,
             "variables": parse_template_variables(request.draft_template),
         }
+    return get_prompt_template(request.prompt_name, request.prompt_version)
+
+
+async def _load_prompt_data(request: RunRequest) -> dict:
     try:
-        return get_prompt_template(request.prompt_name, request.prompt_version)
+        return await asyncio.to_thread(_load_prompt_data_sync, request)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -97,40 +102,36 @@ def _log_run_artifacts(run_id: str, rendered: str, rendered_system: str | None, 
             logger.warning("link_prompt_version_to_run failed (non-fatal): %s", e)
 
 
-@router.post("/run", response_model=RunResponse)
-async def api_run_prompt(request: RunRequest):
-    """Run a prompt with variable substitution against a selected model."""
-    _validate_variables(request.variables)
-    prompt_data = _load_prompt_data(request)
-    rendered = render_template(prompt_data["template"], request.variables)
-    system_prompt_raw = prompt_data.get("system_prompt")
-    rendered_system = render_template(system_prompt_raw, request.variables) if system_prompt_raw else None
-
-    # Call model inside an MLflow trace so it appears in the Traces tab
+async def _run_with_mlflow_logging(
+    request: RunRequest,
+    rendered: str,
+    rendered_system: str | None,
+) -> tuple[dict, str | None, str | None]:
+    """Run model call inside an MLflow run; blocking MLflow work runs in a thread."""
+    configure_mlflow()
+    exp_id = await asyncio.to_thread(get_experiment_id, request.experiment_name)
+    run_name = f"{request.prompt_name.split('.')[-1]}-v{request.prompt_version}"
     run_id = None
-    exp_url = None
+    exp_url = experiment_url(exp_id) if exp_id else None
     result = None
 
     try:
-        configure_mlflow()
-        exp_id = get_experiment_id(request.experiment_name)
-        run_name = f"{request.prompt_name.split('.')[-1]}-v{request.prompt_version}"
-
         with mlflow.start_run(experiment_id=exp_id, run_name=run_name) as run:
-            mlflow.set_tags({
-                "mlflow.runName": run_name,
-                "prompt_name": request.prompt_name,
-                "prompt_version": request.prompt_version,
-                "model": request.model_name,
-                "is_draft": str(request.draft_template is not None).lower(),
-            })
-            mlflow.log_params({k: v[:250] for k, v in request.variables.items()})
-            mlflow.log_param("model_name", request.model_name)
-            mlflow.log_param("prompt_version", request.prompt_version)
+            await asyncio.to_thread(
+                lambda: (
+                    mlflow.set_tags({
+                        "mlflow.runName": run_name,
+                        "prompt_name": request.prompt_name,
+                        "prompt_version": request.prompt_version,
+                        "model": request.model_name,
+                        "is_draft": str(request.draft_template is not None).lower(),
+                    }),
+                    mlflow.log_params({k: v[:250] for k, v in request.variables.items()}),
+                    mlflow.log_param("model_name", request.model_name),
+                    mlflow.log_param("prompt_version", request.prompt_version),
+                )
+            )
 
-            # call_model() uses the OpenAI SDK — mlflow.openai.autolog()
-            # automatically creates a traced span with token usage, latencies,
-            # and structured inputs/outputs. No manual span plumbing needed.
             try:
                 result = await call_model(
                     endpoint_name=request.model_name,
@@ -142,75 +143,91 @@ async def api_run_prompt(request: RunRequest):
             except Exception as e:
                 raise HTTPException(status_code=502, detail=f"Model call failed: {e}")
 
-            # The autolog span has closed — get the trace ID it produced.
-            # Flush async trace logging so the trace exists on the server
-            # before we try to set tags on it.
             trace_id = mlflow.get_last_active_trace_id()
             if trace_id:
-                mlflow.flush_trace_async_logging(terminate=False)
+                await asyncio.to_thread(mlflow.flush_trace_async_logging, False)
 
-            # Set request/response previews so they show in the Traces UI.
             if trace_id:
-                try:
-                    get_mlflow_client().set_trace_tag(
-                        trace_id, "mlflow.traceRequestPreview", rendered[:200]
-                    )
-                    get_mlflow_client().set_trace_tag(
-                        trace_id, "mlflow.traceResponsePreview", result["content"][:200]
-                    )
-                except Exception:
-                    pass
+                await asyncio.to_thread(
+                    _set_trace_previews,
+                    trace_id,
+                    rendered,
+                    result["content"],
+                )
 
-            # Link prompt version to the trace so it appears in the Version
-            # column of the Traces UI.  We use the REST API first, then also
-            # set the tag manually as a fallback (the API previously broke the
-            # drill-down link — if that regresses, remove the API call).
             if request.draft_template is None and trace_id:
-                try:
-                    client = get_mlflow_client()
-                    pv = client.get_prompt_version(
-                        name=request.prompt_name,
-                        version=request.prompt_version,
-                    )
-                    client.link_prompt_versions_to_trace(
-                        prompt_versions=[pv],
-                        trace_id=trace_id,
-                    )
-                except Exception as e:
-                    logger.warning("link_prompt_versions_to_trace failed (non-fatal): %s", e)
-                try:
-                    prompt_link = json.dumps([{
-                        "name": request.prompt_name,
-                        "version": request.prompt_version,
-                    }])
-                    get_mlflow_client().set_trace_tag(
-                        trace_id, "mlflow.linkedPrompts", prompt_link
-                    )
-                except Exception as e:
-                    logger.warning("set_trace_tag mlflow.linkedPrompts failed (non-fatal): %s", e)
+                await asyncio.to_thread(
+                    _link_prompt_to_trace,
+                    request,
+                    trace_id,
+                )
 
-            _log_run_artifacts(run.info.run_id, rendered, rendered_system, result, request)
-
+            await asyncio.to_thread(
+                _log_run_artifacts,
+                run.info.run_id,
+                rendered,
+                rendered_system,
+                result,
+                request,
+            )
             run_id = run.info.run_id
-
-        if exp_id:
-            exp_url = experiment_url(exp_id)
 
     except HTTPException:
         raise
     except Exception as e:
         logger.warning("MLflow logging failed (non-fatal): %s", e)
         if result is None:
-            try:
-                result = await call_model(
-                    endpoint_name=request.model_name,
-                    prompt=rendered,
-                    max_tokens=request.max_tokens,
-                    temperature=request.temperature,
-                    system_prompt=rendered_system,
-                )
-            except Exception as model_err:
-                raise HTTPException(status_code=502, detail=f"Model call failed: {model_err}")
+            result = await call_model(
+                endpoint_name=request.model_name,
+                prompt=rendered,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                system_prompt=rendered_system,
+            )
+        return result, run_id, exp_url
+
+    return result, run_id, exp_url
+
+
+def _set_trace_previews(trace_id: str, rendered: str, response_content: str) -> None:
+    try:
+        client = get_mlflow_client()
+        client.set_trace_tag(trace_id, "mlflow.traceRequestPreview", rendered[:200])
+        client.set_trace_tag(trace_id, "mlflow.traceResponsePreview", response_content[:200])
+    except Exception:
+        pass
+
+
+def _link_prompt_to_trace(request: RunRequest, trace_id: str) -> None:
+    try:
+        client = get_mlflow_client()
+        pv = client.get_prompt_version(
+            name=request.prompt_name,
+            version=request.prompt_version,
+        )
+        client.link_prompt_versions_to_trace(prompt_versions=[pv], trace_id=trace_id)
+    except Exception as e:
+        logger.warning("link_prompt_versions_to_trace failed (non-fatal): %s", e)
+    try:
+        prompt_link = json.dumps([{
+            "name": request.prompt_name,
+            "version": request.prompt_version,
+        }])
+        get_mlflow_client().set_trace_tag(trace_id, "mlflow.linkedPrompts", prompt_link)
+    except Exception as e:
+        logger.warning("set_trace_tag mlflow.linkedPrompts failed (non-fatal): %s", e)
+
+
+@router.post("/run", response_model=RunResponse)
+async def api_run_prompt(request: RunRequest):
+    """Run a prompt with variable substitution against a selected model."""
+    _validate_variables(request.variables)
+    prompt_data = await _load_prompt_data(request)
+    rendered = render_template(prompt_data["template"], request.variables)
+    system_prompt_raw = prompt_data.get("system_prompt")
+    rendered_system = render_template(system_prompt_raw, request.variables) if system_prompt_raw else None
+
+    result, run_id, exp_url = await _run_with_mlflow_logging(request, rendered, rendered_system)
 
     return RunResponse(
         rendered_prompt=rendered,
@@ -233,7 +250,9 @@ class PreviewRequest(BaseModel):
 async def api_preview_prompt(request: PreviewRequest):
     """Preview a rendered prompt without calling a model."""
     try:
-        prompt_data = get_prompt_template(request.prompt_name, request.prompt_version)
+        prompt_data = await asyncio.to_thread(
+            get_prompt_template, request.prompt_name, request.prompt_version
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

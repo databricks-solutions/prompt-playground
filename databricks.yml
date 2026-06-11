@@ -16,11 +16,6 @@ sync:
     - '.venv/'
 
 variables:
-  warehouse_id:
-    description: "SQL Warehouse for eval dataset queries"
-    lookup:
-      warehouse: "Serverless Starter Warehouse"   # replace with your warehouse name if different
-
   serving_endpoint:
     description: "Model serving endpoint name — common options: databricks-claude-sonnet-4-5, databricks-claude-haiku-3-5, databricks-meta-llama-3-3-70b-instruct"
     default: "databricks-claude-sonnet-4-5"
@@ -41,10 +36,6 @@ variables:
     description: "Schema for evaluation datasets"
     default: ""
 
-  mlflow_experiment_name:
-    description: "Default MLflow experiment for traces and eval runs"
-    default: ""
-
   evaluate_tab_enabled:
     description: "Show the experimental Evaluate tab in the UI (true/false)"
     default: "false"
@@ -57,10 +48,6 @@ resources:
       source_code_path: ./src
 
       resources:
-        - name: sql-warehouse
-          sql_warehouse:
-            id: ${var.warehouse_id}
-            permission: CAN_USE
         - name: serving-endpoint
           serving_endpoint:
             name: ${var.serving_endpoint}

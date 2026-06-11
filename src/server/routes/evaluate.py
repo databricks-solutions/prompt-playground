@@ -3,8 +3,10 @@
 import logging
 import asyncio
 import mlflow
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel, Field
+from server.cache import TtlCache
+from server.eval_jobs import create_job, get_job, run_job, update_job
 from server.mlflow_client import get_prompt_template, list_prompts
 from server.templates import render_template, parse_system_user
 from server.mlflow_helpers import (
@@ -23,6 +25,58 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/eval", tags=["evaluate"])
 
+# Cap workspace-wide experiment scans so the header dropdown stays responsive on shared workspaces.
+_EXPERIMENT_BROWSE_MAX = 50
+_EXPERIMENT_FILTER_CANDIDATE_MAX = 100
+_EXPERIMENT_SEARCH_MIN_LEN = 2
+_EXPERIMENT_PROMPTS_CACHE = TtlCache(ttl_sec=120)
+_EXPERIMENT_BROWSE_CACHE = TtlCache(ttl_sec=300)
+
+
+def _experiment_payload(exp) -> dict:
+    return {
+        "name": exp.name,
+        "experiment_id": exp.experiment_id,
+        "url": make_experiment_url(exp.experiment_id),
+    }
+
+
+def _active_experiments(experiments) -> list:
+    return [e for e in experiments if e.lifecycle_stage == "active"]
+
+
+def _get_active_experiment_by_name(client, name: str):
+    if not name:
+        return None
+    try:
+        exp = client.get_experiment_by_name(name)
+    except Exception:
+        return None
+    if exp and exp.lifecycle_stage == "active":
+        return exp
+    return None
+
+
+def _browse_experiments(client, *, max_results: int) -> list:
+    experiments = client.search_experiments(max_results=max_results)
+    return _active_experiments(experiments)
+
+
+def _cached_browse_experiments(client, *, max_results: int) -> list:
+    cache_key = f"browse:{max_results}"
+    cached = _EXPERIMENT_BROWSE_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+    result = _browse_experiments(client, max_results=max_results)
+    _EXPERIMENT_BROWSE_CACHE.set(cache_key, result)
+    return result
+
+
+def _configured_experiment_payload(client) -> list[dict]:
+    configured_name = configured_mlflow_experiment_name()
+    exp = _get_active_experiment_by_name(client, configured_name)
+    return [_experiment_payload(exp)] if exp else []
+
 
 def _get_warehouse_id() -> str:
     """Resolve the effective SQL warehouse ID from persisted settings or env var."""
@@ -37,54 +91,138 @@ def _get_warehouse_id() -> str:
 
 # --- Discovery routes ---
 
+@router.post("/experiments/warm")
+async def warm_experiment_cache():
+    """Populate the experiment browse cache in the background (page load / dropdown open)."""
+    async def _warm() -> None:
+        try:
+            client = get_mlflow_client()
+            await asyncio.to_thread(
+                _cached_browse_experiments,
+                client,
+                max_results=_EXPERIMENT_BROWSE_MAX,
+            )
+        except Exception as e:
+            logger.debug("experiment cache warm failed (non-fatal): %s", e)
+
+    asyncio.create_task(_warm())
+    return {"status": "warming"}
+
+
 @router.get("/experiments")
-async def api_list_experiments(catalog: str | None = None, schema: str | None = None):
+async def api_list_experiments(
+    catalog: str | None = None,
+    schema: str | None = None,
+    q: str | None = Query(None, description="Case-insensitive substring filter (min 2 chars)"),
+    configured_only: bool = Query(
+        False,
+        description="Return only the experiment saved in Settings (instant)",
+    ),
+    browse: bool = Query(
+        False,
+        description="Return a capped workspace browse (header dropdown), not the Settings default only",
+    ),
+):
     """List active MLflow experiments for the dropdown.
 
-    When catalog and schema are provided, filters to only experiments that contain
-    runs logged from prompts in that catalog.schema (using the prompt_name run tag).
-    Falls back to all experiments if no matches found.
+    Uses the configured default experiment when set (fast path). Otherwise returns a
+    capped recent slice of workspace experiments — never the full unbounded list.
+    Results are cached server-side for several minutes after the first browse.
+
+    When catalog and schema are provided, filters to experiments with runs tagged
+    for that catalog.schema prompt prefix, searching only the default experiment or
+    a capped candidate set instead of the full workspace.
     """
     try:
-        client = get_mlflow_client()
-        experiments = await asyncio.to_thread(client.search_experiments)
-        active = [e for e in experiments if e.lifecycle_stage == "active"]
-
-        if not catalog or not schema:
-            return {"experiments": [
-                {"name": e.name, "experiment_id": e.experiment_id, "url": make_experiment_url(e.experiment_id)} for e in active
-            ]}
-
-        # Sanitize: only allow word chars and hyphens in catalog/schema names
         import re
-        if not re.match(r'^[\w\-]+$', catalog) or not re.match(r'^[\w\-]+$', schema):
-            return {"experiments": [
-                {"name": e.name, "experiment_id": e.experiment_id, "url": make_experiment_url(e.experiment_id)} for e in active
-            ]}
 
-        all_ids = [e.experiment_id for e in active]
+        client = get_mlflow_client()
+        configured_name = configured_mlflow_experiment_name()
+
+        def _browse_payload(max_results: int):
+            return [
+                _experiment_payload(e)
+                for e in _cached_browse_experiments(client, max_results=max_results)
+            ]
+
+        if configured_only:
+            configured = await asyncio.to_thread(_configured_experiment_payload, client)
+            return {"experiments": configured}
+
+        query = (q or "").strip()
+        if not catalog or not schema:
+            if (
+                not browse
+                and configured_name
+                and len(query) < _EXPERIMENT_SEARCH_MIN_LEN
+            ):
+                configured = await asyncio.to_thread(_configured_experiment_payload, client)
+                if configured:
+                    return {"experiments": configured}
+            browsed = await asyncio.to_thread(_browse_payload, _EXPERIMENT_BROWSE_MAX)
+            if len(query) >= _EXPERIMENT_SEARCH_MIN_LEN:
+                needle = query.lower()
+                browsed = [e for e in browsed if needle in e["name"].lower()]
+            return {"experiments": browsed}
+
+        if not re.match(r"^[\w\-]+$", catalog) or not re.match(r"^[\w\-]+$", schema):
+            if (
+                not browse
+                and configured_name
+                and len(query) < _EXPERIMENT_SEARCH_MIN_LEN
+            ):
+                configured = await asyncio.to_thread(_configured_experiment_payload, client)
+                if configured:
+                    return {"experiments": configured}
+            browsed = await asyncio.to_thread(_browse_payload, _EXPERIMENT_BROWSE_MAX)
+            if len(query) >= _EXPERIMENT_SEARCH_MIN_LEN:
+                needle = query.lower()
+                browsed = [e for e in browsed if needle in e["name"].lower()]
+            return {"experiments": browsed}
+
         prefix = f"{catalog}.{schema}."
-        # MLflow caps search_runs at 100 experiment IDs per call — batch as needed
-        relevant_ids: set[str] = set()
-        chunk_size = 100
-        for i in range(0, len(all_ids), chunk_size):
-            chunk = all_ids[i:i + chunk_size]
-            runs = await asyncio.to_thread(
-                client.search_runs,
-                chunk,
-                f"tags.prompt_name LIKE '{prefix}%'",
-                max_results=500,
-            )
-            relevant_ids.update(run.info.experiment_id for run in runs)
-        filtered = [e for e in active if e.experiment_id in relevant_ids]
+        filter_string = f"tags.prompt_name LIKE '{prefix}%'"
 
-        # Fall back to all experiments if nothing matched (e.g. fresh workspace)
-        return {"experiments": [
-            {"name": e.name, "experiment_id": e.experiment_id, "url": make_experiment_url(e.experiment_id)}
-            for e in (filtered if filtered else active)
-        ]}
+        def _filter_candidates():
+            configured_exp = _get_active_experiment_by_name(client, configured_name)
+            if configured_exp:
+                candidate_ids = [configured_exp.experiment_id]
+                candidate_exps = [configured_exp]
+            else:
+                candidate_exps = _cached_browse_experiments(
+                    client, max_results=_EXPERIMENT_FILTER_CANDIDATE_MAX
+                )
+                candidate_ids = [e.experiment_id for e in candidate_exps]
+
+            matched_ids: set[str] = set()
+            chunk_size = 100
+            for i in range(0, len(candidate_ids), chunk_size):
+                chunk = candidate_ids[i : i + chunk_size]
+                if not chunk:
+                    continue
+                runs = client.search_runs(chunk, filter_string, max_results=500)
+                matched_ids.update(run.info.experiment_id for run in runs)
+
+            filtered = [e for e in candidate_exps if e.experiment_id in matched_ids]
+            if filtered:
+                payloads = [_experiment_payload(e) for e in filtered]
+            elif configured_exp:
+                payloads = [_experiment_payload(configured_exp)]
+            else:
+                payloads = [_experiment_payload(e) for e in candidate_exps[:_EXPERIMENT_BROWSE_MAX]]
+
+            if len(query) >= _EXPERIMENT_SEARCH_MIN_LEN:
+                needle = query.lower()
+                payloads = [e for e in payloads if needle in e["name"].lower()]
+            return payloads
+
+        return {"experiments": await asyncio.to_thread(_filter_candidates)}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        from server.routes.setup import _raise_from_setup_error
+
+        _raise_from_setup_error(e)
 
 
 @router.get("/experiments/prompts")
@@ -106,14 +244,23 @@ async def api_get_experiment_prompts(
         if not experiment:
             return {"prompt_names": []}
         exp_id = experiment.experiment_id
+        cache_key = f"{catalog}.{schema}:{exp_id}"
 
-        # Primary: filter prompts by _mlflow_experiment_ids tag
-        all_prompts = await asyncio.to_thread(list_prompts, catalog, schema)
-        tagged = sorted(
-            p["name"]
-            for p in all_prompts
-            if f",{exp_id}," in p.get("tags", {}).get("_mlflow_experiment_ids", "")
-        )
+        def _tagged_from_cache():
+            cached = _EXPERIMENT_PROMPTS_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            all_prompts = list_prompts(catalog, schema)
+            tagged = sorted(
+                p["name"]
+                for p in all_prompts
+                if f",{exp_id}," in p.get("tags", {}).get("_mlflow_experiment_ids", "")
+            )
+            if tagged:
+                _EXPERIMENT_PROMPTS_CACHE.set(cache_key, tagged)
+            return tagged
+
+        tagged = await asyncio.to_thread(_tagged_from_cache)
         if tagged:
             return {"prompt_names": tagged}
 
@@ -382,15 +529,25 @@ async def api_run_traces(run_id: str):
 
 
 @router.get("/table-preview")
-async def api_table_preview(catalog: str, schema: str, table: str, limit: int = 20):
-    """Return column names, a sample of rows, and total row count for the dataset preview UI."""
+async def api_table_preview(
+    catalog: str,
+    schema: str,
+    table: str,
+    limit: int = 20,
+    include_count: bool = Query(False, description="Run COUNT(*) — slower on large tables"),
+):
+    """Return column names and a sample of rows for the dataset preview UI."""
     try:
         warehouse_id = _get_warehouse_id()
-        cols, rows, total_rows = await asyncio.gather(
+        cols, rows = await asyncio.gather(
             asyncio.to_thread(get_table_columns, catalog, schema, table, warehouse_id),
             asyncio.to_thread(read_table_rows, catalog, schema, table, warehouse_id, limit=limit),
-            asyncio.to_thread(count_table_rows, catalog, schema, table, warehouse_id),
         )
+        total_rows = None
+        if include_count:
+            total_rows = await asyncio.to_thread(
+                count_table_rows, catalog, schema, table, warehouse_id
+            )
         return {"columns": cols, "rows": rows, "total_rows": total_rows}
     except HTTPException:
         raise
@@ -446,13 +603,33 @@ class EvalResponse(BaseModel):
     experiment_url: str | None = None
 
 
-@router.post("/run", response_model=EvalResponse)
-async def api_run_evaluation(request: EvalRequest):
+class EvalJobStartResponse(BaseModel):
+    job_id: str
+    status: str = "pending"
+
+
+class EvalJobStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    progress: int = 0
+    total: int = 0
+    message: str = ""
+    result: EvalResponse | None = None
+    error: str | None = None
+
+
+async def _execute_evaluation(
+    request: EvalRequest,
+    *,
+    job_id: str | None = None,
+) -> EvalResponse:
     """Run a prompt version against every row in an eval dataset and score with mlflow.genai.evaluate()."""
 
     # Load prompt template
     try:
-        prompt_data = get_prompt_template(request.prompt_name, request.prompt_version)
+        prompt_data = await asyncio.to_thread(
+            get_prompt_template, request.prompt_name, request.prompt_version
+        )
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -476,6 +653,10 @@ async def api_run_evaluation(request: EvalRequest):
 
     if not rows:
         raise HTTPException(status_code=400, detail="Dataset is empty")
+
+    total_rows = len(rows)
+    if job_id:
+        await update_job(job_id, total=total_rows, progress=0, message="Running model on rows…")
 
     # Pre-flight: verify all mapped columns (including expectations) actually exist in the dataset
     available_cols = set(rows[0].keys())
@@ -521,6 +702,9 @@ async def api_run_evaluation(request: EvalRequest):
                 raise  # propagate to abort the entire eval
             except Exception as e:
                 response_text = f"[ERROR: {e}]"
+        if job_id:
+            pct = int(((i + 1) / total_rows) * 70)
+            await update_job(job_id, progress=pct, message=f"Row {i + 1} of {total_rows}")
         return (i, variables, rendered, rendered_system, response_text, expectations_val)
 
     try:
@@ -558,6 +742,8 @@ async def api_run_evaluation(request: EvalRequest):
     if all_errored:
         logger.warning("All %d rows errored — skipping mlflow_genai_evaluate", len(row_data))
     else:
+        if job_id:
+            await update_job(job_id, progress=75, message="Scoring with MLflow…")
         try:
             run_name = f"eval-{request.prompt_name.split('.')[-1]}-v{request.prompt_version}"
             run_id, row_scores = await asyncio.to_thread(
@@ -618,6 +804,9 @@ async def api_run_evaluation(request: EvalRequest):
         except Exception as e:
             logger.warning("Failed to log avg_score metric (non-fatal): %s", e)
 
+    if job_id:
+        await update_job(job_id, progress=100, message="Complete")
+
     return EvalResponse(
         prompt_name=request.prompt_name,
         prompt_version=request.prompt_version,
@@ -628,4 +817,40 @@ async def api_run_evaluation(request: EvalRequest):
         avg_score=avg_score,
         run_id=run_id,
         experiment_url=exp_url,
+    )
+
+
+@router.post("/run", response_model=EvalJobStartResponse)
+async def api_run_evaluation(request: EvalRequest, background_tasks: BackgroundTasks):
+    """Enqueue a batch evaluation job and return a job_id for polling."""
+    job_id = await create_job()
+
+    async def _runner(active_job_id: str):
+        try:
+            result = await _execute_evaluation(request, job_id=active_job_id)
+            return result.model_dump()
+        except HTTPException as e:
+            raise RuntimeError(e.detail) from e
+
+    background_tasks.add_task(run_job, job_id, _runner)
+    return EvalJobStartResponse(job_id=job_id)
+
+
+@router.get("/run/status", response_model=EvalJobStatusResponse)
+async def api_eval_job_status(job_id: str = Query(..., min_length=1)):
+    """Poll background eval job status. Result is present when status is completed."""
+    job = await get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+    result = None
+    if job.get("result"):
+        result = EvalResponse(**job["result"])
+    return EvalJobStatusResponse(
+        job_id=job_id,
+        status=job.get("status", "unknown"),
+        progress=job.get("progress", 0),
+        total=job.get("total", 0),
+        message=job.get("message", ""),
+        result=result,
+        error=job.get("error"),
     )

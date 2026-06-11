@@ -6,9 +6,11 @@ at app startup), every call automatically produces MLflow traces with token
 usage, latencies, and structured spans — no manual span plumbing required.
 """
 
+import os
 import re
 import logging
 from openai import AsyncOpenAI, APIStatusError, APITimeoutError
+from server.cache import TtlCache
 from server.config import get_workspace_host, get_oauth_token, get_workspace_client
 
 logger = logging.getLogger(__name__)
@@ -61,6 +63,16 @@ EXCLUDE_NAME_PATTERNS = [
     "kie-",
 ]
 
+# Legacy / deprecated foundation endpoints (extend via DEPRECATED_MODEL_ENDPOINTS env)
+DEPRECATED_NAME_PATTERNS = [
+    "-deprecated",
+    "_deprecated",
+    "-legacy",
+    "_legacy",
+]
+
+_ENDPOINTS_CACHE = TtlCache(ttl_sec=180)
+
 # Foundation Model API endpoints always start with "databricks-"
 FOUNDATION_PREFIX = "databricks-"
 
@@ -84,6 +96,22 @@ def _get_openai_client() -> AsyncOpenAI:
     return _openai_client
 
 
+def _deprecated_blocklist() -> set[str]:
+    raw = os.environ.get("DEPRECATED_MODEL_ENDPOINTS", "")
+    return {n.strip() for n in raw.split(",") if n.strip()}
+
+
+def _is_deprecated_endpoint(name: str, state: str) -> bool:
+    if name in _deprecated_blocklist():
+        return True
+    low = name.lower()
+    if any(pat in low for pat in DEPRECATED_NAME_PATTERNS):
+        return True
+    if "deprecated" in state.lower():
+        return True
+    return False
+
+
 def _clean_state(state_str: str) -> str:
     """Normalize state strings like 'EndpointStateReady.READY' to 'READY'."""
     if "." in state_str:
@@ -97,6 +125,11 @@ def list_serving_endpoints(filter_chat_only: bool = True) -> list[dict]:
     Returns only endpoints whose task is llm/v1/chat or llm/v1/completions,
     or Foundation Model API endpoints (databricks-*), excluding embeddings.
     """
+    cache_key = f"endpoints:chat={int(filter_chat_only)}"
+    cached = _ENDPOINTS_CACHE.get(cache_key)
+    if cached is not None:
+        return list(cached)
+
     w = get_workspace_client()
     endpoints = []
     try:
@@ -116,6 +149,9 @@ def list_serving_endpoints(filter_chat_only: bool = True) -> list[dict]:
             if any(pat in ep.name for pat in EXCLUDE_NAME_PATTERNS):
                 continue
 
+            if _is_deprecated_endpoint(ep.name, state):
+                continue
+
             if filter_chat_only:
                 is_foundation = ep.name.startswith(FOUNDATION_PREFIX)
                 is_chat = task.lower() in CHAT_TASKS
@@ -128,10 +164,23 @@ def list_serving_endpoints(filter_chat_only: bool = True) -> list[dict]:
                 "task": task,
             })
     except Exception as e:
+        msg = str(e).lower()
+        if any(
+            needle in msg
+            for needle in (
+                "cannot get access token",
+                "token refresh",
+                "credential was not sent",
+                "unauthorized",
+                "401",
+            )
+        ):
+            raise
         logger.error("Error listing serving endpoints: %s", e)
 
     # Sort: foundation models first, then alphabetical
     endpoints.sort(key=lambda x: (0 if x["name"].startswith(FOUNDATION_PREFIX) else 1, x["name"]))
+    _ENDPOINTS_CACHE.set(cache_key, endpoints)
     return endpoints
 
 

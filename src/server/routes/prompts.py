@@ -7,10 +7,11 @@ with dots in names.
 
 import asyncio
 import logging
-import os
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 import httpx
+from server.cache import TtlCache
+from server.config import get_workspace_host, get_oauth_token
 from server.mlflow_client import (
     list_prompts,
     get_prompt_versions,
@@ -22,6 +23,19 @@ from server.mlflow_client import (
 from server.mlflow_helpers import configure_mlflow
 
 logger = logging.getLogger(__name__)
+
+_PROMPTS_CACHE = TtlCache(ttl_sec=120)
+
+
+def _prompts_cache_key(catalog: str, schema: str) -> str:
+    return f"{catalog}.{schema}"
+
+
+def invalidate_prompts_cache(catalog: str | None = None, schema: str | None = None) -> None:
+    if catalog and schema:
+        _PROMPTS_CACHE.invalidate(_prompts_cache_key(catalog, schema))
+    else:
+        _PROMPTS_CACHE.invalidate()
 
 
 def _is_permission_error(detail: str) -> bool:
@@ -56,16 +70,14 @@ async def _register_prompt_in_experiment(prompt_name: str, experiment_name: str)
         return
     exp_id = experiment.experiment_id
 
-    # Read existing experiment IDs tag (comma-delimited, e.g. ",123,456,")
-    host = os.environ.get("DATABRICKS_HOST", "").rstrip("/")
-    token = os.environ.get("DATABRICKS_TOKEN", "")
+    host = get_workspace_host().rstrip("/")
+    try:
+        token = get_oauth_token()
+    except Exception as e:
+        logger.warning("Cannot set experiment tag: %s", e)
+        return
     if not host or not token:
-        # Fall back to mlflow config
-        import mlflow
-        host = mlflow.get_tracking_uri().replace("databricks", os.environ.get("DATABRICKS_HOST", ""))
-        token = os.environ.get("DATABRICKS_TOKEN", "")
-    if not host or not token:
-        logger.warning("Cannot set experiment tag: no DATABRICKS_HOST/TOKEN")
+        logger.warning("Cannot set experiment tag: no workspace host or token")
         return
 
     headers = {"Authorization": f"Bearer {token}"}
@@ -88,7 +100,15 @@ async def api_list_prompts(
 ):
     """List all registered prompts in the given catalog.schema."""
     try:
-        prompts = await asyncio.to_thread(list_prompts, catalog=catalog, schema=schema)
+        cache_key = _prompts_cache_key(catalog, schema)
+
+        def _load():
+            return _PROMPTS_CACHE.get_or_set(
+                cache_key,
+                lambda: list_prompts(catalog=catalog, schema=schema),
+            )
+
+        prompts = await asyncio.to_thread(_load)
         return {"prompts": prompts, "catalog": catalog, "schema": schema}
     except Exception as e:
         detail = str(e)
@@ -150,11 +170,16 @@ async def api_create_prompt(request: CreatePromptRequest):
     if not request.template or not request.template.strip():
         raise HTTPException(status_code=400, detail="Template cannot be empty")
     try:
-        result = create_prompt(
-            name=request.name.strip(),
+        name = request.name.strip()
+        result = await asyncio.to_thread(
+            create_prompt,
+            name=name,
             template=request.template,
             description=request.description,
         )
+        parts = name.split(".")
+        if len(parts) >= 2:
+            invalidate_prompts_cache(parts[0], parts[1])
         # Register prompt in the experiment so it shows in the filtered list
         if request.experiment_name:
             try:
@@ -187,11 +212,16 @@ async def api_create_prompt_version(request: CreateVersionRequest):
     if not request.template or not request.template.strip():
         raise HTTPException(status_code=400, detail="Template cannot be empty")
     try:
-        result = create_prompt_version(
-            name=request.name.strip(),
+        name = request.name.strip()
+        result = await asyncio.to_thread(
+            create_prompt_version,
+            name=name,
             template=request.template,
             description=request.description,
         )
+        parts = name.split(".")
+        if len(parts) >= 2:
+            invalidate_prompts_cache(parts[0], parts[1])
         return result
     except Exception as e:
         detail = str(e)
