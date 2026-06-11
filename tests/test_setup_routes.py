@@ -4,10 +4,12 @@ Covers:
 - GET /api/setup/catalogs — list Unity Catalog catalogs, sorted
 - GET /api/setup/schemas  — list schemas within a catalog, sorted
 - GET /api/setup/warehouses — list SQL warehouses, sorted by name, id+name required
-- All endpoints return 500 on workspace errors
+- 401 on Databricks unauthenticated / bad credential errors
+- Other workspace errors return 500
 """
 
 import pytest
+from databricks.sdk.errors import Unauthenticated
 from unittest.mock import patch, MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -167,7 +169,7 @@ class TestListWarehouses:
         assert names == ["Alpha Warehouse", "Main Warehouse", "Zebra Warehouse"]
 
     def test_warehouses_without_id_excluded(self, client):
-        """Warehouses missing id or name are filtered out."""
+        """Warehouses missing id are skipped; missing name get a display label."""
         w = _mock_workspace(warehouses=[
             {"id": "wh-1", "name": "Good"},
             {"id": None, "name": "No ID"},
@@ -176,8 +178,10 @@ class TestListWarehouses:
         with patch("server.routes.setup.get_workspace_client", return_value=w):
             resp = client.get("/api/setup/warehouses")
         whs = resp.json()["warehouses"]
-        assert len(whs) == 1
+        assert len(whs) == 2
         assert whs[0]["id"] == "wh-1"
+        assert whs[1]["id"] == "wh-3"
+        assert whs[1]["name"] == "Warehouse wh-3"
 
     def test_empty_warehouse_list(self, client):
         w = _mock_workspace(warehouses=[])
@@ -192,3 +196,24 @@ class TestListWarehouses:
             resp = client.get("/api/setup/warehouses")
         assert resp.status_code == 500
         assert "Workspace unreachable" in resp.json()["detail"]
+
+    def test_unauthenticated_returns_401_with_hint(self, client):
+        w = MagicMock()
+        w.warehouses.list.side_effect = Unauthenticated(
+            "401: Credential was not sent or was of an unsupported type"
+        )
+        with patch("server.routes.setup.get_workspace_client", return_value=w):
+            resp = client.get("/api/setup/warehouses")
+        assert resp.status_code == 401
+        body = resp.json()["detail"]
+        assert "DATABRICKS_HOST" in body
+
+    def test_message_containing_401_returns_401(self, client):
+        w = MagicMock()
+        w.warehouses.list.side_effect = RuntimeError(
+            "401: Credential was not sent or was of an unsupported type [ReqId: x]"
+        )
+        with patch("server.routes.setup.get_workspace_client", return_value=w):
+            resp = client.get("/api/setup/warehouses")
+        assert resp.status_code == 401
+        assert "DATABRICKS_TOKEN" in resp.json()["detail"]

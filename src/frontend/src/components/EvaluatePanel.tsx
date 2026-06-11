@@ -202,7 +202,15 @@ export default function EvaluatePanel({
   };
 
   return (
-    <div className="h-full flex overflow-hidden">
+    <div className="h-full flex flex-col overflow-hidden">
+      <div
+        role="status"
+        className="shrink-0 px-4 py-2.5 bg-amber-50 border-b border-amber-100 text-xs text-amber-950"
+      >
+        <strong className="font-semibold">Experimental — not fully tested.</strong> Batch evaluation is enabled for
+        exploration; verify scores and behavior before relying on results in production workflows.
+      </div>
+      <div className="flex-1 flex overflow-hidden min-h-0">
       {/* Left config panel */}
       <div className="w-1/3 min-w-[272px] flex-shrink-0 border-r border-gray-200 bg-white flex flex-col overflow-hidden">
       {!hasWarehouse && evalCatalog && (
@@ -594,6 +602,7 @@ export default function EvaluatePanel({
             </div>
           </div>
         )}
+      </div>
       </div>
 
       {/* Delete judge confirmation */}

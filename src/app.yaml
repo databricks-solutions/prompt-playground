@@ -9,12 +9,16 @@ command:
 env:
   - name: SQL_WAREHOUSE_ID
     valueFrom: sql-warehouse
+  # Filled from bundle variables on deploy (${var.*}); empty for local dev unless env is exported.
   - name: MLFLOW_EXPERIMENT_NAME
-    value: "/Shared/prompt-playground-evaluation"
-  # Update these three values to match your Unity Catalog setup before deploying
+    value: ${var.mlflow_experiment_name}
   - name: PROMPT_CATALOG
-    value: "your_catalog"
+    value: ${var.prompt_catalog}
   - name: PROMPT_SCHEMA
-    value: "prompts"
+    value: ${var.prompt_schema}
+  - name: EVAL_CATALOG
+    value: ${var.eval_catalog}
   - name: EVAL_SCHEMA
-    value: "eval_data"
+    value: ${var.eval_schema}
+  - name: EVALUATE_TAB_ENABLED
+    value: ${var.evaluate_tab_enabled}

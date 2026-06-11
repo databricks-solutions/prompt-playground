@@ -187,13 +187,9 @@ def test_list_prompts_success(client):
     assert data["schema"] == "prompts"
 
 
-def test_list_prompts_uses_default_catalog_schema(client):
-    with patch("server.routes.prompts.list_prompts") as mock_list:
-        mock_list.return_value = []
-        response = client.get("/api/prompts")
-
-    assert response.status_code == 200
-    mock_list.assert_called_once_with(catalog="main", schema="prompts")
+def test_list_prompts_requires_catalog_and_schema(client):
+    response = client.get("/api/prompts")
+    assert response.status_code == 422
 
 
 def test_list_prompts_custom_catalog_schema(client):

@@ -5,6 +5,7 @@ import { usePromptTemplate } from '../hooks/usePromptApi';
 import { computeLineDiff, getTemplateText } from '../utils/diffUtils';
 import { parseSystemUser } from '../utils/templateUtils';
 import DiffView, { DiffLines } from './DiffView';
+import SearchableSelect from './SearchableSelect';
 
 type ViewMode = 'chat' | 'raw';
 
@@ -93,32 +94,36 @@ export default function PromptDiffView({ promptName, versions, currentVersion, o
           </button>
         </div>
 
-        {/* Version selectors */}
-        <div className="flex items-center gap-1.5 ml-auto">
-          <select
-            value={versionA}
-            onChange={(e) => setVersionA(e.target.value)}
-            className="border border-gray-200 rounded-md px-2 py-1 text-gray-700 bg-white focus:outline-none focus:ring-1 focus:ring-databricks-red text-xs font-mono"
-          >
-            {versions.map((v) => (
-              <option key={v.version} value={v.version}>
-                v{v.version}{v.aliases.length ? ` (${v.aliases.join(', ')})` : ''}
-              </option>
-            ))}
-          </select>
-          <span className="text-gray-400 text-xs">→</span>
-          <select
-            value={versionB}
-            onChange={(e) => setVersionB(e.target.value)}
-            disabled={onlyOneVersion}
-            className="border border-gray-200 rounded-md px-2 py-1 text-gray-700 bg-white focus:outline-none focus:ring-1 focus:ring-databricks-red text-xs font-mono disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {versions.map((v) => (
-              <option key={v.version} value={v.version}>
-                v{v.version}{v.aliases.length ? ` (${v.aliases.join(', ')})` : ''}
-              </option>
-            ))}
-          </select>
+        {/* Version selectors — same SearchableSelect pattern as the rest of the app */}
+        <div className="flex items-center gap-1.5 ml-auto min-w-0">
+          <div className="w-36">
+            <SearchableSelect
+              value={versionA}
+              onChange={setVersionA}
+              allowClear={false}
+              placeholder="Base version…"
+              options={versions.map((v) => ({
+                value: v.version,
+                label: `v${v.version}${v.aliases.length ? ` (${v.aliases.join(', ')})` : ''}`,
+              }))}
+              className="!py-1.5 !text-xs font-mono"
+            />
+          </div>
+          <span className="text-gray-400 text-xs shrink-0">→</span>
+          <div className="w-36">
+            <SearchableSelect
+              value={versionB}
+              onChange={setVersionB}
+              disabled={onlyOneVersion}
+              allowClear={false}
+              placeholder="Compare to…"
+              options={versions.map((v) => ({
+                value: v.version,
+                label: `v${v.version}${v.aliases.length ? ` (${v.aliases.join(', ')})` : ''}`,
+              }))}
+              className="!py-1.5 !text-xs font-mono"
+            />
+          </div>
         </div>
 
         {/* Chat/Raw toggle */}

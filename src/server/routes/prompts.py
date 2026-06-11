@@ -83,8 +83,8 @@ router = APIRouter(prefix="/api/prompts", tags=["prompts"])
 
 @router.get("")
 async def api_list_prompts(
-    catalog: str = Query(default="main", description="Unity Catalog name"),
-    schema: str = Query(default="prompts", description="Schema name"),
+    catalog: str = Query(..., min_length=1, description="Unity Catalog name"),
+    schema: str = Query(..., min_length=1, description="Schema name"),
 ):
     """List all registered prompts in the given catalog.schema."""
     try:

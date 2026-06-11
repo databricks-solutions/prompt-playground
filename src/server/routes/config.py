@@ -41,6 +41,7 @@ async def get_config(background_tasks: BackgroundTasks):
         "mlflow_experiment_name": cfg["mlflow_experiment_name"],
         "sql_warehouse_id": wh_id,
         "sql_warehouse_name": wh_name,
+        "evaluate_tab_enabled": bool(cfg.get("evaluate_tab_enabled", False)),
     }
 
 
@@ -52,6 +53,7 @@ class ConfigUpdate(BaseModel):
     mlflow_experiment_name: str | None = None
     sql_warehouse_id: str | None = None
     sql_warehouse_name: str | None = None
+    evaluate_tab_enabled: bool | None = None
 
 
 @router.post("")

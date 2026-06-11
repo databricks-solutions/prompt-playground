@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
-import { ChevronDown, Loader2 } from 'lucide-react';
+import { ChevronDown } from 'lucide-react';
+import { LoadingSpinner, LoadingSpinnerInset } from './LoadingSpinner';
 
 export interface SelectOption {
   value: string;
@@ -207,6 +208,8 @@ export default function SearchableSelect({
           </span>
         )}
 
+        {loading && !open && <LoadingSpinnerInset />}
+
         <ChevronDown
           className={`absolute right-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none transition-transform duration-150 ${
             open ? 'rotate-180' : ''
@@ -220,7 +223,7 @@ export default function SearchableSelect({
           <div className="max-h-52 overflow-y-auto">
             {loading ? (
               <div className="flex items-center gap-2 px-3 py-3 text-xs text-gray-400">
-                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading…
+                <LoadingSpinner className="w-3.5 h-3.5 text-gray-400" /> Loading…
               </div>
             ) : (
               <>

@@ -282,7 +282,9 @@ class TestGetExperimentPrompts:
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
              patch("server.routes.evaluate.configure_mlflow"):
-            resp = client.get("/api/eval/experiments/prompts?experiment_name=nonexistent")
+            resp = client.get(
+                "/api/eval/experiments/prompts?experiment_name=nonexistent&catalog=main&schema=prompts"
+            )
 
         assert resp.status_code == 200
         assert resp.json()["prompt_names"] == []
@@ -321,7 +323,9 @@ class TestGetExperimentPrompts:
 
         with patch("server.routes.evaluate.get_mlflow_client", return_value=mock_client), \
              patch("server.routes.evaluate.configure_mlflow"):
-            resp = client.get("/api/eval/experiments/prompts?experiment_name=exp")
+            resp = client.get(
+                "/api/eval/experiments/prompts?experiment_name=exp&catalog=main&schema=prompts"
+            )
 
         assert resp.status_code == 500
         assert "MLflow error" in resp.json()["detail"]

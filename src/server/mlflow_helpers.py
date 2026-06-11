@@ -12,10 +12,12 @@ from server.config import get_workspace_host, IS_DATABRICKS_APP
 
 logger = logging.getLogger(__name__)
 
-EXPERIMENT_NAME = os.environ.get(
-    "MLFLOW_EXPERIMENT_NAME",
-    "/Shared/prompt-playground-evaluation",
-)
+
+def configured_mlflow_experiment_name() -> str:
+    """MLflow experiment name from settings / env only (no hardcoded path in code)."""
+    from server.settings import get_effective_config
+
+    return (get_effective_config().get("mlflow_experiment_name") or "").strip()
 
 
 def configure_mlflow():
@@ -36,10 +38,12 @@ def get_mlflow_client() -> MlflowClient:
 
 
 def get_experiment_id(experiment_name: str | None = None) -> str | None:
-    """Look up experiment ID by name, falling back to the default experiment."""
+    """Look up experiment ID by name, else the name from app settings / MLFLOW_EXPERIMENT_NAME env."""
     try:
         configure_mlflow()
-        name = experiment_name or EXPERIMENT_NAME
+        name = (experiment_name or "").strip() or configured_mlflow_experiment_name()
+        if not name:
+            return None
         exp = mlflow.get_experiment_by_name(name)
         return exp.experiment_id if exp else None
     except Exception as e:

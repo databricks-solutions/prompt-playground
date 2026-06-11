@@ -124,13 +124,15 @@ def test_effective_config_env_defaults(monkeypatch):
 def test_effective_config_defaults_when_no_env(monkeypatch):
     monkeypatch.delenv("PROMPT_CATALOG", raising=False)
     monkeypatch.delenv("PROMPT_SCHEMA", raising=False)
+    monkeypatch.delenv("EVAL_CATALOG", raising=False)
     monkeypatch.delenv("EVAL_SCHEMA", raising=False)
+    monkeypatch.delenv("MLFLOW_EXPERIMENT_NAME", raising=False)
     monkeypatch.delenv("SQL_WAREHOUSE_ID", raising=False)
 
     cfg = get_effective_config()
     assert cfg["prompt_catalog"] == ""
-    assert cfg["prompt_schema"] == "prompts"
-    assert cfg["eval_schema"] == "eval_data"
+    assert cfg["prompt_schema"] == ""
+    assert cfg["eval_schema"] == ""
     assert cfg["sql_warehouse_id"] == ""
 
 

@@ -2,34 +2,55 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type { ExperimentInfo, JudgeInfo, EvalResponse, EvalHistoryRun, EvalTraceRow } from '../types';
 import { apiFetch, useMutation } from './useApi';
 
-export function useExperiments() {
+export function useExperiments(enabled: boolean) {
   const [experiments, setExperiments] = useState<ExperimentInfo[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
-    setLoading(true);
-    try {
-      const data = await apiFetch<{ experiments: ExperimentInfo[] }>('/eval/experiments');
-      setExperiments(data.experiments);
-    } catch {
+    if (!enabled) {
       setExperiments([]);
+      setLoading(false);
+      setError(null);
+      return;
+    }
+    setLoading(true);
+    setError(null);
+    try {
+      const data = await apiFetch<{ experiments: ExperimentInfo[] }>('/eval/experiments', {
+        timeoutMs: 25_000,
+      });
+      setExperiments(data.experiments);
+    } catch (e) {
+      setExperiments([]);
+      setError(e instanceof Error ? e.message : 'Could not load MLflow experiments');
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [enabled]);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
 
-  return { experiments, loading, refresh };
+  return { experiments, loading, error, refresh };
 }
 
-export function useExperimentPrompts(experimentName: string, catalog?: string, schema?: string) {
+export function useExperimentPrompts(
+  experimentName: string,
+  catalog?: string,
+  schema?: string,
+  enabled: boolean = true,
+) {
   const [promptNames, setPromptNames] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(false);
 
   const refresh = useCallback(async () => {
+    if (!enabled) {
+      setPromptNames(null);
+      setLoading(false);
+      return;
+    }
     setPromptNames(null);
     if (!experimentName) return;
     setLoading(true);
@@ -37,14 +58,17 @@ export function useExperimentPrompts(experimentName: string, catalog?: string, s
     if (catalog) params.set('catalog', catalog);
     if (schema) params.set('schema', schema);
     try {
-      const d = await apiFetch<{ prompt_names: string[] }>(`/eval/experiments/prompts?${params.toString()}`);
+      const d = await apiFetch<{ prompt_names: string[] }>(
+        `/eval/experiments/prompts?${params.toString()}`,
+        { timeoutMs: 25_000 },
+      );
       setPromptNames(d.prompt_names.length > 0 ? d.prompt_names : null);
     } catch {
       setPromptNames(null);
     } finally {
       setLoading(false);
     }
-  }, [experimentName, catalog, schema]);
+  }, [experimentName, catalog, schema, enabled]);
 
   useEffect(() => {
     refresh();

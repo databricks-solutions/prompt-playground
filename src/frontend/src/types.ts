@@ -125,4 +125,6 @@ export interface AppConfig {
   mlflow_experiment_name: string;
   sql_warehouse_id: string;
   sql_warehouse_name: string;
+  /** When false (default), the Evaluate tab is hidden in the UI. */
+  evaluate_tab_enabled: boolean;
 }

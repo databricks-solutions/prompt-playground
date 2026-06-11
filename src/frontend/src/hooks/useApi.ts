@@ -10,16 +10,40 @@ import type { AppConfig } from '../types';
 
 const API_BASE = '/api';
 
-export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  });
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(body.detail || `API error: ${res.status}`);
+export type ApiFetchOptions = RequestInit & { timeoutMs?: number };
+
+export async function apiFetch<T>(path: string, options?: ApiFetchOptions): Promise<T> {
+  const { timeoutMs, ...init } = options ?? {};
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let signal = init.signal;
+  let abortWasTimeout = false;
+  if (timeoutMs != null && signal === undefined) {
+    const ctrl = new AbortController();
+    timer = setTimeout(() => {
+      abortWasTimeout = true;
+      ctrl.abort();
+    }, timeoutMs);
+    signal = ctrl.signal;
   }
-  return res.json();
+  try {
+    const res = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers: { 'Content-Type': 'application/json', ...init.headers },
+      signal,
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({ detail: res.statusText }));
+      throw new Error(body.detail || `API error: ${res.status}`);
+    }
+    return res.json();
+  } catch (e) {
+    if (abortWasTimeout && e instanceof DOMException && e.name === 'AbortError') {
+      throw new Error(`Request timed out after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -61,10 +85,19 @@ export function useConfig() {
   const refresh = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await apiFetch<AppConfig>('/config');
+      const data = await apiFetch<AppConfig>('/config', { timeoutMs: 15_000 });
       setConfig(data);
     } catch {
-      setConfig({ prompt_catalog: '', prompt_schema: 'prompts', eval_catalog: '', eval_schema: 'eval_data', mlflow_experiment_name: '/Shared/prompt-playground-evaluation', sql_warehouse_id: '', sql_warehouse_name: '' });
+      setConfig({
+        prompt_catalog: '',
+        prompt_schema: '',
+        eval_catalog: '',
+        eval_schema: '',
+        mlflow_experiment_name: '',
+        sql_warehouse_id: '',
+        sql_warehouse_name: '',
+        evaluate_tab_enabled: false,
+      });
     } finally {
       setLoading(false);
     }

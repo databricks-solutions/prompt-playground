@@ -34,7 +34,7 @@ def _paginate(client, method_name: str, kwargs: dict, token_attr: str = "token")
         page_token = tok
 
 
-def list_prompts(catalog: str = "main", schema: str = "default") -> list[dict]:
+def list_prompts(catalog: str, schema: str) -> list[dict]:
     """List all registered prompts in a given UC catalog.schema.
 
     Unity Catalog prompt registries require catalog and schema to be specified.

@@ -29,6 +29,8 @@ import {
 } from './hooks/useApi';
 import { usePromptEditor } from './hooks/usePromptEditor';
 
+const PP_SETUP_BANNER_DISMISSED_KEY = 'pp-setup-banner-dismissed';
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('prompts');
   const [pendingTab, setPendingTab] = useState<Tab | null>(null);
@@ -37,6 +39,14 @@ export default function App() {
   const [showCreatePrompt, setShowCreatePrompt] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showDiff, setShowDiff] = useState(false);
+
+  const [setupBannerDismissed, setSetupBannerDismissed] = useState(() => {
+    try {
+      return sessionStorage.getItem(PP_SETUP_BANNER_DISMISSED_KEY) === '1';
+    } catch {
+      return false;
+    }
+  });
 
   // Load catalog/schema config from backend (set via app.yaml env vars)
   const { config, loading: configLoading, refresh: refreshConfig, isConfigured } = useConfig();
@@ -49,23 +59,32 @@ export default function App() {
   const [experimentName, setExperimentName] = useState('');
   const [filterByExperiment, setFilterByExperiment] = useState(true);
 
+  /** Prompt catalog set — UC prompts, experiment ↔ prompt filtering, header “connected”. */
+  const workspaceReady = !configLoading && isConfigured;
+
+  /** Fetch MLflow experiment list as soon as `/api/config` returns — parallel with Settings; no prompt catalog required. */
+  const experimentsPrefetchEnabled = !configLoading;
+
   // Sync catalog/schema/experiment from config once it loads
   useEffect(() => {
     if (config && !catalog) {
       setCatalog(config.prompt_catalog);
       setSchema(config.prompt_schema);
     }
-    if (config && !experimentName) {
+    // Only apply default MLflow experiment after workspace is configured (avoid UC/MLflow calls before Settings)
+    if (config && isConfigured && !experimentName) {
       setExperimentName(config.mlflow_experiment_name);
     }
-  }, [config]);
+  }, [config, isConfigured, catalog, experimentName]);
 
-  // Auto-open settings on first load if app is unconfigured
+  const evaluateTabEnabled = !!config?.evaluate_tab_enabled;
+
+  // Leave Evaluate if the tab is turned off in Settings
   useEffect(() => {
-    if (!configLoading && !isConfigured) {
-      setShowSettings(true);
+    if (!evaluateTabEnabled && activeTab === 'evaluate') {
+      setActiveTab('prompts');
     }
-  }, [configLoading, isConfigured]);
+  }, [evaluateTabEnabled, activeTab]);
 
   // Use '' as fallback (not 'main') so usePrompts won't fire until config is loaded
   const activeCatalog = catalog || config?.prompt_catalog || '';
@@ -100,8 +119,18 @@ export default function App() {
     refresh: refreshModels,
     ensureLoaded: ensureModelsLoaded,
   } = useModels();
-  const { experiments, loading: experimentsLoading } = useExperiments();
-  const { promptNames: experimentPromptNames, loading: experimentPromptsLoading, refresh: refreshExperimentPrompts } = useExperimentPrompts(experimentName, activeCatalog, activeSchema);
+  const {
+    experiments,
+    loading: experimentsLoading,
+    error: experimentsError,
+    refresh: refreshExperiments,
+  } = useExperiments(experimentsPrefetchEnabled);
+  const { promptNames: experimentPromptNames, loading: experimentPromptsLoading, refresh: refreshExperimentPrompts } = useExperimentPrompts(
+    experimentName,
+    activeCatalog,
+    activeSchema,
+    workspaceReady,
+  );
   const filteredPrompts = (filterByExperiment && experimentPromptNames)
     ? prompts.filter((p) => experimentPromptNames.includes(p.name) || p.name === selectedPrompt)
     : prompts;
@@ -230,10 +259,50 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-gray-50">
+      {!configLoading && !isConfigured && !setupBannerDismissed && (
+        <div
+          role="status"
+          className="flex flex-wrap items-center justify-between gap-3 px-4 sm:px-6 py-3 bg-amber-50 border-b border-amber-100 text-sm text-amber-950 shrink-0"
+        >
+          <span className="min-w-0">
+            <strong className="font-semibold">Setup required.</strong>{' '}
+            Choose a Prompt Registry catalog, schema, and SQL warehouse in Settings. Until then, prompts and MLflow
+            experiments stay idle so the UI stays responsive offline.
+          </span>
+          <span className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowSettings(true)}
+              className="px-3 py-1.5 rounded-md bg-amber-900 text-white text-xs font-medium hover:bg-amber-800"
+            >
+              Open Settings
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                try {
+                  sessionStorage.setItem(PP_SETUP_BANNER_DISMISSED_KEY, '1');
+                } catch {
+                  /* ignore */
+                }
+                setSetupBannerDismissed(true);
+              }}
+              className="px-2 py-1 text-xs text-amber-900/80 underline hover:text-amber-950"
+            >
+              Dismiss
+            </button>
+          </span>
+        </div>
+      )}
+
       <Header
         experimentName={experimentName}
         experiments={experiments}
         experimentsLoading={experimentsLoading}
+        experimentsError={experimentsError}
+        onRetryExperiments={refreshExperiments}
+        workspaceConfigured={workspaceReady}
+        settingsOpen={showSettings}
         onExperimentChange={handleExperimentChange}
         onOpenSettings={() => setShowSettings(true)}
         filterByExperiment={filterByExperiment}
@@ -243,7 +312,12 @@ export default function App() {
         totalCount={prompts.length}
       />
 
-      <TabBar activeTab={activeTab} onTabChange={handleTabChange} experimentUrl={experimentUrl} />
+      <TabBar
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        experimentUrl={experimentUrl}
+        evaluateTabEnabled={evaluateTabEnabled}
+      />
 
 
       <main className="flex-1 overflow-hidden">
@@ -253,7 +327,7 @@ export default function App() {
         <div className={activeTab !== 'evaluate' ? 'hidden' : 'h-full'}>
           <EvaluatePanel
             evalCatalog={config?.eval_catalog ?? activeCatalog}
-            evalSchema={config?.eval_schema ?? 'eval_data'}
+            evalSchema={config?.eval_schema ?? ''}
             prompts={filteredPrompts}
             versions={versions}
             selectedPrompt={selectedPrompt}

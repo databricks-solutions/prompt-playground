@@ -13,12 +13,20 @@ interface Props {
   activeTab: Tab;
   onTabChange: (tab: Tab) => void;
   experimentUrl?: string;
+  evaluateTabEnabled?: boolean;
 }
 
-export default function TabBar({ activeTab, onTabChange, experimentUrl }: Props) {
+export default function TabBar({
+  activeTab,
+  onTabChange,
+  experimentUrl,
+  evaluateTabEnabled = false,
+}: Props) {
+  const visibleTabs = evaluateTabEnabled ? TABS : TABS.filter((t) => t.id !== 'evaluate');
+
   return (
     <div className="bg-white border-b border-gray-200 px-4 flex items-center gap-1">
-      {TABS.map(({ id, label, icon: Icon }) => (
+      {visibleTabs.map(({ id, label, icon: Icon }) => (
         <button
           key={id}
           onClick={() => onTabChange(id)}

@@ -47,6 +47,7 @@ def _mock_mlflow(mock_mlflow):
     mock_span.__exit__ = MagicMock(return_value=False)
     mock_span.request_id = "test-trace-id"
     mock_mlflow.start_span.return_value = mock_span
+    mock_mlflow.get_last_active_trace_id = MagicMock(return_value="test-trace-id")
 
     for attr in ("log_text", "log_metrics", "log_params", "log_param", "set_tags"):
         setattr(mock_mlflow, attr, MagicMock())

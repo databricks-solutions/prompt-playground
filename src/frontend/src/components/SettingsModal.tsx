@@ -23,6 +23,7 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
   const [evalSchema, setEvalSchema] = useState(config.eval_schema);
   const [warehouseId, setWarehouseId] = useState(config.sql_warehouse_id);
   const [warehouseName, setWarehouseName] = useState(config.sql_warehouse_name);
+  const [evaluateTabEnabled, setEvaluateTabEnabled] = useState(!!config.evaluate_tab_enabled);
 
   // Discovery state
   const [catalogs, setCatalogs] = useState<string[]>([]);
@@ -34,70 +35,112 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
   const [evalSchemasLoading, setEvalSchemasLoading] = useState(false);
   const [warehousesLoading, setWarehousesLoading] = useState(false);
 
+  const [catalogsError, setCatalogsError] = useState<string | null>(null);
+  const [warehousesError, setWarehousesError] = useState<string | null>(null);
+  const [promptSchemasError, setPromptSchemasError] = useState<string | null>(null);
+  const [evalSchemasError, setEvalSchemasError] = useState<string | null>(null);
+
   // Save state
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Track what has been fetched to avoid duplicate requests
-  const catalogsLoadedRef = useRef(false);
-  const warehousesLoadedRef = useRef(false);
-  const promptSchemasLoadedForRef = useRef('');
-  const evalSchemasLoadedForRef = useRef('');
+  /** Only dedupe concurrent in-flight calls — never block retries after failure or when reopening the dropdown */
+  const catalogsInFlight = useRef(false);
+  const warehousesInFlight = useRef(false);
 
   const loadCatalogs = () => {
-    if (catalogsLoadedRef.current) return;
-    catalogsLoadedRef.current = true;
+    if (catalogsInFlight.current) return;
+    catalogsInFlight.current = true;
     setCatalogsLoading(true);
+    setCatalogsError(null);
     apiFetch<{ catalogs: string[] }>('/setup/catalogs')
-      .then((d) => setCatalogs(d.catalogs))
-      .catch(() => setCatalogs([]))
-      .finally(() => setCatalogsLoading(false));
+      .then((d) => {
+        setCatalogs(d.catalogs);
+        setCatalogsError(null);
+      })
+      .catch((e: unknown) => {
+        setCatalogs([]);
+        setCatalogsError(e instanceof Error ? e.message : 'Could not load catalogs');
+      })
+      .finally(() => {
+        catalogsInFlight.current = false;
+        setCatalogsLoading(false);
+      });
   };
 
   const loadPromptSchemas = (cat: string) => {
-    if (!cat || cat === promptSchemasLoadedForRef.current) return;
-    promptSchemasLoadedForRef.current = cat;
+    if (!cat) return;
     setPromptSchemasLoading(true);
+    setPromptSchemasError(null);
     apiFetch<{ schemas: string[] }>(`/setup/schemas?${new URLSearchParams({ catalog: cat })}`)
-      .then((d) => setPromptSchemas(d.schemas))
-      .catch(() => setPromptSchemas([]))
+      .then((d) => {
+        setPromptSchemas(d.schemas);
+        setPromptSchemasError(null);
+      })
+      .catch((e: unknown) => {
+        setPromptSchemas([]);
+        setPromptSchemasError(e instanceof Error ? e.message : 'Could not load schemas');
+      })
       .finally(() => setPromptSchemasLoading(false));
   };
 
   const loadEvalSchemas = (cat: string) => {
-    if (!cat || cat === evalSchemasLoadedForRef.current) return;
-    evalSchemasLoadedForRef.current = cat;
+    if (!cat) return;
     setEvalSchemasLoading(true);
+    setEvalSchemasError(null);
     apiFetch<{ schemas: string[] }>(`/setup/schemas?${new URLSearchParams({ catalog: cat })}`)
-      .then((d) => setEvalSchemas(d.schemas))
-      .catch(() => setEvalSchemas([]))
+      .then((d) => {
+        setEvalSchemas(d.schemas);
+        setEvalSchemasError(null);
+      })
+      .catch((e: unknown) => {
+        setEvalSchemas([]);
+        setEvalSchemasError(e instanceof Error ? e.message : 'Could not load schemas');
+      })
       .finally(() => setEvalSchemasLoading(false));
   };
 
   const loadWarehouses = () => {
-    if (warehousesLoadedRef.current) return;
-    warehousesLoadedRef.current = true;
+    if (warehousesInFlight.current) return;
+    warehousesInFlight.current = true;
     setWarehousesLoading(true);
+    setWarehousesError(null);
     apiFetch<{ warehouses: Warehouse[] }>('/setup/warehouses')
-      .then((d) => setWarehouses(d.warehouses))
-      .catch(() => setWarehouses([]))
-      .finally(() => setWarehousesLoading(false));
+      .then((d) => {
+        setWarehouses(d.warehouses);
+        setWarehousesError(null);
+      })
+      .catch((e: unknown) => {
+        setWarehouses([]);
+        setWarehousesError(e instanceof Error ? e.message : 'Could not load SQL warehouses');
+      })
+      .finally(() => {
+        warehousesInFlight.current = false;
+        setWarehousesLoading(false);
+      });
   };
 
-  // On mount: eager-load only when no default
+  // On mount: eager-load discovery lists (always fetch warehouses so name→id can resolve for Save)
   useEffect(() => {
     if (!catalog) loadCatalogs();
     if (catalog && !promptSchema) loadPromptSchemas(catalog);
     if (evalCatalog && !evalSchema) loadEvalSchemas(evalCatalog);
-    // Eager-load warehouses when an ID is configured but the name hasn't been saved yet
-    if (warehouseId && !warehouseName) loadWarehouses();
+    loadWarehouses();
   }, []);
+
+  // After warehouses load, attach sql_warehouse_id when we only have a name (common right after config resolve)
+  useEffect(() => {
+    if (warehouseId || !warehouseName?.trim() || warehouses.length === 0) return;
+    const name = warehouseName.trim();
+    const wh = warehouses.find((w) => w.name === name || w.name.trim() === name);
+    if (wh) setWarehouseId(wh.id);
+  }, [warehouses, warehouseName, warehouseId]);
 
   const handleCatalogChange = (val: string) => {
     setCatalog(val);
     setPromptSchema('');
     setPromptSchemas([]);
-    promptSchemasLoadedForRef.current = '';
+    setPromptSchemasError(null);
     if (val) loadPromptSchemas(val);
   };
 
@@ -105,13 +148,30 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
     setEvalCatalog(val);
     setEvalSchema('');
     setEvalSchemas([]);
-    evalSchemasLoadedForRef.current = '';
+    setEvalSchemasError(null);
     if (val) loadEvalSchemas(val);
+  };
+
+  const resolveWarehouseId = () => {
+    if (warehouseId) return warehouseId;
+    const n = warehouseName?.trim();
+    if (!n) return '';
+    const wh = warehouses.find((w) => w.name === n || w.name.trim() === n);
+    return wh?.id ?? '';
   };
 
   const handleSave = async () => {
     if (!catalog) { setError('Please select a catalog.'); return; }
-    if (!warehouseId) { setError('Please select a SQL warehouse.'); return; }
+    if (!promptSchema?.trim()) { setError('Please enter or select a prompt schema.'); return; }
+    if (evaluateTabEnabled) {
+      if (!evalCatalog?.trim()) { setError('Please select an eval dataset catalog.'); return; }
+      if (!evalSchema?.trim()) { setError('Please enter or select an eval dataset schema.'); return; }
+    }
+    const wid = resolveWarehouseId();
+    if (!wid) {
+      setError('Please select a SQL warehouse from the list (wait for warehouses to load if needed).');
+      return;
+    }
     setSaving(true);
     setError(null);
     try {
@@ -119,11 +179,12 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
         method: 'POST',
         body: JSON.stringify({
           prompt_catalog: catalog,
-          prompt_schema: promptSchema || 'prompts',
-          eval_catalog: evalCatalog || catalog,
-          eval_schema: evalSchema || 'eval_data',
-          sql_warehouse_id: warehouseId,
-          sql_warehouse_name: warehouseName,
+          prompt_schema: promptSchema.trim(),
+          eval_catalog: evalCatalog.trim(),
+          eval_schema: evalSchema.trim(),
+          sql_warehouse_id: wid,
+          sql_warehouse_name: warehouseName?.trim() || warehouses.find((w) => w.id === wid)?.name || '',
+          evaluate_tab_enabled: evaluateTabEnabled,
         }),
       });
       onSave(updated);
@@ -180,8 +241,15 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
               <SearchableSelect
                 value={warehouseName}
                 onChange={(name) => {
-                  const wh = warehouses.find((w) => w.name === name);
-                  if (wh) { setWarehouseId(wh.id); setWarehouseName(wh.name); }
+                  const wh = warehouses.find(
+                    (w) => w.name === name || w.name.trim() === name.trim(),
+                  );
+                  if (wh) {
+                    setWarehouseId(wh.id);
+                    setWarehouseName(wh.name);
+                  } else if (name.trim()) {
+                    setWarehouseName(name.trim());
+                  }
                 }}
                 options={warehouses.map((w) => ({ value: w.name, label: w.name }))}
                 placeholder="Select a warehouse..."
@@ -189,6 +257,14 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
                 onOpen={loadWarehouses}
                 loading={warehousesLoading}
               />
+              {warehousesError && (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                  <strong className="font-medium">Could not load warehouses.</strong> {warehousesError} Open this
+                  dropdown again to retry. For local dev, run{' '}
+                  <code className="text-[11px] bg-amber-100 px-1 rounded">databricks auth login</code> for the same
+                  workspace the app uses.
+                </p>
+              )}
             </div>
           </div>
 
@@ -218,6 +294,9 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
                 onOpen={loadCatalogs}
                 loading={catalogsLoading}
               />
+              {catalogsError && (
+                <p className="text-xs text-red-600">{catalogsError}</p>
+              )}
             </div>
 
             <div className="space-y-1.5">
@@ -235,11 +314,14 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
                 value={promptSchema}
                 onChange={setPromptSchema}
                 options={promptSchemas.map((s) => ({ value: s, label: s }))}
-                placeholder="prompts"
+                placeholder="Select a schema…"
                 allowClear={false}
                 onOpen={() => loadPromptSchemas(catalog)}
                 loading={promptSchemasLoading}
               />
+              {promptSchemasError && (
+                <p className="text-xs text-red-600">{promptSchemasError}</p>
+              )}
             </div>
           </div>
 
@@ -247,7 +329,33 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
 
           {/* Evaluation section */}
           <div className="space-y-4">
-            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Evaluation Data</h3>
+            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Evaluate Tab</h3>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={evaluateTabEnabled}
+                onChange={(e) => setEvaluateTabEnabled(e.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-gray-300 text-databricks-red focus:ring-databricks-red"
+              />
+              <span className="text-sm text-gray-700">
+                <span className="font-medium">Show Evaluate tab</span>
+                <span className="block text-xs text-gray-500 mt-0.5">
+                  Off by default. Turn on to expose batch evaluation in the tab bar.
+                </span>
+              </span>
+            </label>
+
+            {evaluateTabEnabled && (
+              <p className="text-xs text-amber-900 bg-amber-50 border border-amber-100 rounded-lg px-3 py-2">
+                <strong className="font-semibold">Experimental.</strong> Evaluate has not been fully tested — use for
+                exploration only and verify results before relying on them.
+              </p>
+            )}
+
+            {evaluateTabEnabled && (
+              <>
+            <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wide pt-1">Evaluation Data</h3>
 
             <div className="space-y-1.5">
               <div className="flex items-center gap-1.5">
@@ -286,12 +394,17 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
                 value={evalSchema}
                 onChange={setEvalSchema}
                 options={evalSchemas.map((s) => ({ value: s, label: s }))}
-                placeholder="eval_data"
+                placeholder="Select a schema…"
                 allowClear={false}
                 onOpen={() => loadEvalSchemas(evalCatalog)}
                 loading={evalSchemasLoading}
               />
+              {evalSchemasError && (
+                <p className="text-xs text-red-600">{evalSchemasError}</p>
+              )}
             </div>
+              </>
+            )}
           </div>
         </div>
 
@@ -300,7 +413,14 @@ export default function SettingsModal({ config, onSave, onClose }: Props) {
           {error && <p className="text-xs text-red-600">{error}</p>}
           <button
             onClick={handleSave}
-            disabled={saving || !catalog || !warehouseId}
+            disabled={
+              saving ||
+              !catalog ||
+              !warehouseName?.trim() ||
+              !promptSchema?.trim() ||
+              (evaluateTabEnabled && (!evalCatalog?.trim() || !evalSchema?.trim())) ||
+              !resolveWarehouseId()
+            }
             className="w-full flex items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-databricks-red rounded-md hover:bg-databricks-red/90 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}

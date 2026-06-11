@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { RefreshCw, FileText, Tag, Plus } from 'lucide-react';
+import { LoadingSpinner } from './LoadingSpinner';
 import type { PromptInfo, PromptVersion } from '../types';
 import SearchableSelect from './SearchableSelect';
 
@@ -61,10 +62,14 @@ export default function PromptSelector({
             </button>
             <button
               onClick={onRefresh}
-              className="text-gray-400 hover:text-gray-600 transition-colors"
+              className="inline-flex h-5 w-5 items-center justify-center text-gray-400 hover:text-gray-600 transition-colors"
               title="Refresh prompts"
             >
-              <RefreshCw className={`w-3.5 h-3.5 ${promptsLoading ? 'animate-spin' : ''}`} />
+              {promptsLoading ? (
+                <LoadingSpinner className="w-3.5 h-3.5 text-gray-500" />
+              ) : (
+                <RefreshCw className="w-3.5 h-3.5" />
+              )}
             </button>
           </div>
         </div>
@@ -81,13 +86,13 @@ export default function PromptSelector({
             onSelectPrompt(val || null);
             onSelectVersion(null);
           }}
-          disabled={promptsLoading}
+          loading={promptsLoading}
           placeholder={
             promptsLoading
-              ? 'Loading prompts...'
+              ? 'Loading prompts from registry…'
               : prompts.length === 0
                 ? 'No prompts found'
-                : 'Select a prompt...'
+                : 'Select a prompt…'
           }
           options={prompts.map((p) => ({ value: p.name, label: shortName(p.name) }))}
         />

@@ -25,6 +25,30 @@ variables:
     description: "Model serving endpoint name — common options: databricks-claude-sonnet-4-5, databricks-claude-haiku-3-5, databricks-meta-llama-3-3-70b-instruct"
     default: "databricks-claude-sonnet-4-5"
 
+  prompt_catalog:
+    description: "Unity Catalog for MLflow Prompt Registry"
+    default: ""
+
+  prompt_schema:
+    description: "Schema for registered prompts"
+    default: ""
+
+  eval_catalog:
+    description: "Unity Catalog for evaluation datasets (Delta tables)"
+    default: ""
+
+  eval_schema:
+    description: "Schema for evaluation datasets"
+    default: ""
+
+  mlflow_experiment_name:
+    description: "Default MLflow experiment for traces and eval runs"
+    default: ""
+
+  evaluate_tab_enabled:
+    description: "Show the experimental Evaluate tab in the UI (true/false)"
+    default: "false"
+
 resources:
   apps:
     prompt_playground:

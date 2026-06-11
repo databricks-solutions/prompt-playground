@@ -161,11 +161,11 @@ class TestParseSystemUserXml:
         assert system is None
         assert user == template
 
-    def test_xml_real_world_hinge_style(self):
-        """Matches the actual format used in hinge_profile_bio_coach prompt."""
+    def test_xml_real_world_multi_variable_prompt(self):
+        """System/user XML with several template variables (typical registry prompt)."""
         template = (
             "<system>\n"
-            "You are a professional dating profile coach for {{company}}.\n"
+            "You are a helpful assistant for {{company}}.\n"
             "Your tone is warm but direct.\n"
             "</system>\n\n"
             "<user>\n"
@@ -176,7 +176,7 @@ class TestParseSystemUserXml:
         )
         system, user = parse_system_user(template)
         assert "{{company}}" in system
-        assert "dating profile coach" in system
+        assert "helpful assistant" in system
         assert "{{prompt_question}}" in user
         assert "{{current_answer}}" in user
         assert "{{tone}}" in user

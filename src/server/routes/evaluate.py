@@ -3,11 +3,17 @@
 import logging
 import asyncio
 import mlflow
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from server.mlflow_client import get_prompt_template, list_prompts
 from server.templates import render_template, parse_system_user
-from server.mlflow_helpers import configure_mlflow, get_experiment_id, experiment_url as make_experiment_url, get_mlflow_client, EXPERIMENT_NAME
+from server.mlflow_helpers import (
+    configure_mlflow,
+    configured_mlflow_experiment_name,
+    get_experiment_id,
+    experiment_url as make_experiment_url,
+    get_mlflow_client,
+)
 from server.llm import call_model, EvalAbortError, TokenLimitError, RateLimitError
 from server.warehouse import list_eval_tables, get_table_columns, read_table_rows, count_table_rows
 from server.evaluation import mlflow_genai_evaluate, _extract_row_scores
@@ -83,9 +89,9 @@ async def api_list_experiments(catalog: str | None = None, schema: str | None = 
 
 @router.get("/experiments/prompts")
 async def api_get_experiment_prompts(
-    experiment_name: str,
-    catalog: str = "main",
-    schema: str = "prompts",
+    experiment_name: str = Query(..., min_length=1),
+    catalog: str = Query(..., min_length=1),
+    schema: str = Query(..., min_length=1),
 ):
     """Return prompt names associated with the given experiment.
 
@@ -130,7 +136,10 @@ async def api_get_experiment_prompts(
 
 
 @router.get("/tables")
-async def api_list_eval_tables(catalog: str = "main", schema: str = "eval_data"):
+async def api_list_eval_tables(
+    catalog: str = Query(..., min_length=1),
+    schema: str = Query(..., min_length=1),
+):
     """List tables available as eval datasets."""
     try:
         warehouse_id = _get_warehouse_id()
@@ -147,7 +156,7 @@ async def api_list_judges(experiment_name: str | None = None):
     """List LLM judges (registered scorers) for the given experiment."""
     try:
         configure_mlflow()
-        exp_name = experiment_name or EXPERIMENT_NAME
+        exp_name = (experiment_name or "").strip() or configured_mlflow_experiment_name()
         mlflow.set_experiment(exp_name)
         exp = mlflow.get_experiment_by_name(exp_name)
         exp_id = exp.experiment_id if exp else None
@@ -227,7 +236,7 @@ async def api_create_judge(request: CreateJudgeRequest):
             )
 
         configure_mlflow()
-        exp_name = request.experiment_name or EXPERIMENT_NAME
+        exp_name = (request.experiment_name or "").strip() or configured_mlflow_experiment_name()
         mlflow.set_experiment(exp_name)
         exp = mlflow.get_experiment_by_name(exp_name)
         exp_id = exp.experiment_id if exp else None
@@ -295,7 +304,7 @@ async def api_eval_history(
     try:
         configure_mlflow()
         client = get_mlflow_client()
-        exp_name = experiment_name or EXPERIMENT_NAME
+        exp_name = (experiment_name or "").strip() or configured_mlflow_experiment_name()
         exp = await asyncio.to_thread(client.get_experiment_by_name, exp_name)
         if not exp:
             return {"runs": []}

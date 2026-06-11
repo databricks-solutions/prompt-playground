@@ -9,7 +9,7 @@ import logging
 import mlflow
 import mlflow.genai
 from server.scoring import QualityScorer
-from server.mlflow_helpers import configure_mlflow, get_mlflow_client, EXPERIMENT_NAME
+from server.mlflow_helpers import configure_mlflow, get_mlflow_client, configured_mlflow_experiment_name
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +45,9 @@ def mlflow_genai_evaluate(
     details is a list of per-guideline dicts for Guidelines judges, None otherwise.
     """
     configure_mlflow()
-    exp_name = experiment_name or EXPERIMENT_NAME
+    exp_name = (experiment_name or "").strip() or configured_mlflow_experiment_name()
+    if not exp_name:
+        raise ValueError("No MLflow experiment name configured (Settings or MLFLOW_EXPERIMENT_NAME).")
     mlflow.set_experiment(exp_name)
 
     # Build eval dataset in correct MLflow 3 GenAI format
